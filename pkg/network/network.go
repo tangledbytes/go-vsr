@@ -9,5 +9,5 @@ import (
 
 type Network interface {
 	Send(ipv4port.IPv4Port, func(io.Writer) error) error
-	OnRecv(func(events.NetworkEvent))
+	Recv() (events.NetworkEvent, bool)
 }

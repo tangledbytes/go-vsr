@@ -2,67 +2,50 @@ package main
 
 import (
 	"fmt"
+	"os"
+	"os/signal"
+	"runtime/pprof"
+	"strconv"
 
-	"github.com/tangledbytes/go-vsr/pkg/assert"
-	"github.com/tangledbytes/go-vsr/pkg/events"
-	"github.com/tangledbytes/go-vsr/pkg/network"
-	"github.com/tangledbytes/go-vsr/pkg/replica"
-	"github.com/tangledbytes/go-vsr/pkg/time"
+	"github.com/tangledbytes/go-vsr/internal/simulator"
 )
 
-func generateMembers(num int) []string {
-	members := make([]string, num)
-	for i := 0; i < num; i++ {
-		members[i] = fmt.Sprintf("0.0.0.0:1000%d", i)
+func storeHeap() {
+	f, err := os.Create("heap.pprof")
+	if err != nil {
+		panic(err)
 	}
 
-	return members
-}
-
-func generateReplicas(tolerance int, network *network.Simulated, time *time.Simulated) []*replica.Replica {
-	replicas := make([]*replica.Replica, tolerance*2+1)
-	members := generateMembers(tolerance*2 + 1)
-	for i := 0; i < tolerance*2+1; i++ {
-		cfg := replica.Config{
-			ID:      i,
-			Members: members,
-			Network: network,
-			Time:    time,
-			SrvHandler: func(m string) string {
-				return "{}"
-			},
-			HeartbeatTimeout: 15,
-		}
-		replica, err := replica.New(cfg)
-
-		assert.Assert(err == nil, "err should be nil")
-		replicas[i] = replica
-
-		network.AddRoute(members[i], func(ev events.NetworkEvent) {
-			replica.Submit(ev)
-		})
+	if err := pprof.WriteHeapProfile(f); err != nil {
+		panic(err)
 	}
 
-	return replicas
-}
-
-func runReplica(r *replica.Replica, time time.Time, n int) {
-	for i := 0; i < n; i++ {
-		r.Run()
-		time.Tick()
+	if err := f.Close(); err != nil {
+		panic(err)
 	}
 }
 
 func main() {
-	fmt.Println("Simulator starting...")
-
-	net := network.NewSimulated()
-	time := time.NewSimulated(1)
-	replicas := generateReplicas(1, net, time)
-
-	for {
-		for _, r := range replicas {
-			runReplica(r, time, 1)
-		}
+	if len(os.Args) < 2 {
+		fmt.Println("seed is required")
+		return
 	}
+
+	seed, err := strconv.Atoi(os.Args[1])
+	if err != nil {
+		fmt.Println("invalid seed")
+		return
+	}
+	c := make(chan os.Signal, 1)
+	signal.Notify(c, os.Interrupt)
+
+	go func() {
+		for sig := range c {
+			fmt.Println("captured", sig)
+			storeHeap()
+			os.Exit(1)
+		}
+	}()
+
+	simulator.New(uint64(seed)).Simulate()
 }

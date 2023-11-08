@@ -12,7 +12,7 @@ import (
 	"github.com/tangledbytes/go-vsr/pkg/time"
 )
 
-type vsrState struct {
+type VSRState struct {
 	// ID is the unique ID of the VSR client.
 	ID uint64
 
@@ -34,7 +34,7 @@ type pendingRequest struct {
 	replied bool
 }
 
-type internal struct {
+type Internal struct {
 	request  *queue.Queue[events.ClientRequest]
 	response *queue.Queue[events.Reply]
 	results  *queue.Queue[events.Reply]
@@ -46,8 +46,8 @@ type internal struct {
 
 // Client represents a single client of the VSR cluster.
 type Client struct {
-	state    vsrState
-	internal internal
+	state    VSRState
+	internal Internal
 	net      network.Network
 	time     time.Time
 }
@@ -74,13 +74,13 @@ func New(cfg Config) (*Client, error) {
 	})
 
 	client := &Client{
-		state: vsrState{
+		state: VSRState{
 			ID:                      cfg.ID,
 			RequestNumber:           0,
 			LastKnownClusterMembers: clustermembers,
 			LastKnownViewNumber:     0,
 		},
-		internal: internal{
+		internal: Internal{
 			request:        queue.New[events.ClientRequest](),
 			response:       queue.New[events.Reply](),
 			results:        queue.New[events.Reply](),

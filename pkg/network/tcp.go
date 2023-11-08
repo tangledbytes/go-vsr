@@ -9,6 +9,7 @@ import (
 	"github.com/tangledbytes/go-vsr/pkg/assert"
 	"github.com/tangledbytes/go-vsr/pkg/events"
 	"github.com/tangledbytes/go-vsr/pkg/ipv4port"
+	"github.com/tangledbytes/go-vsr/pkg/queue"
 )
 
 type TCP struct {
@@ -16,8 +17,8 @@ type TCP struct {
 
 	conns map[string]net.Conn
 
-	ch chan events.NetworkEvent
-	mu *sync.RWMutex
+	queue *queue.Queue[events.NetworkEvent]
+	mu    *sync.RWMutex
 }
 
 func NewTCP(hostname string) *TCP {
@@ -29,7 +30,7 @@ func NewTCP(hostname string) *TCP {
 		ip:    ipv4port,
 		conns: make(map[string]net.Conn),
 		mu:    &sync.RWMutex{},
-		ch:    make(chan events.NetworkEvent),
+		queue: queue.New[events.NetworkEvent](),
 	}
 }
 
@@ -81,6 +82,13 @@ func (tcp *TCP) Send(ipv4port ipv4port.IPv4Port, f func(io.Writer) error) error 
 	slog.Debug("attempting to send an event", "ipv4port", ipv4port.String())
 	if err := f(conn); err != nil {
 		slog.Debug("failed to send an event", "err", err)
+
+		if err == net.ErrClosed {
+			tcp.mu.Lock()
+			delete(tcp.conns, ipv4port.String())
+			tcp.mu.Unlock()
+		}
+
 		return err
 	}
 	slog.Debug("sent an event", "ipv4port", ipv4port.String())
@@ -88,18 +96,8 @@ func (tcp *TCP) Send(ipv4port ipv4port.IPv4Port, f func(io.Writer) error) error 
 	return nil
 }
 
-func (tcp *TCP) OnRecv(f func(events.NetworkEvent)) {
-	go func() {
-		slog.Debug("started the event handler")
-
-		for pair := range tcp.ch {
-			slog.Debug("received an event for handler", "ipv4port", pair.Src.String())
-			f(pair)
-			slog.Debug("completed event processing", "ipv4port", pair.Src.String())
-		}
-
-		slog.Debug("stopped the event receiver")
-	}()
+func (tcp *TCP) Recv() (events.NetworkEvent, bool) {
+	return tcp.queue.Pop()
 }
 
 func (tcp *TCP) handleConn(conn net.Conn) {
@@ -115,7 +113,7 @@ func (tcp *TCP) handleConn(conn net.Conn) {
 		}
 
 		slog.Debug("conn received an event", "type", ev.Type, "from", srcaddr.String())
-		tcp.ch <- events.NewNetworkEvent(srcaddr, ev)
+		tcp.queue.Push(events.NewNetworkEvent(srcaddr, ev))
 		slog.Debug("conn sent an event to the handler", "type", ev.Type, "from", srcaddr.String())
 	}
 

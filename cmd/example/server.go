@@ -5,7 +5,6 @@ import (
 	"strings"
 
 	"github.com/tangledbytes/go-vsr/pkg/assert"
-	"github.com/tangledbytes/go-vsr/pkg/events"
 	"github.com/tangledbytes/go-vsr/pkg/network"
 	"github.com/tangledbytes/go-vsr/pkg/replica"
 	"github.com/tangledbytes/go-vsr/pkg/time"
@@ -32,7 +31,7 @@ func newServer(members []string, port string, id int) *server {
 
 func (s *server) run() {
 	replica, err := replica.New(replica.Config{
-		ID:               s.id,
+		ID:               uint64(s.id),
 		Members:          s.members,
 		Network:          s.net,
 		SrvHandler:       s.handleCmd,
@@ -42,12 +41,14 @@ func (s *server) run() {
 
 	assert.Assert(err == nil, "err should be nil")
 
-	s.net.OnRecv(func(ne events.NetworkEvent) {
-		replica.Submit(ne)
-	})
 	go s.net.Run()
 
 	for {
+		ev, ok := s.net.Recv()
+		if ok {
+			replica.Submit(ev)
+		}
+
 		replica.Run()
 		s.time.Tick()
 	}

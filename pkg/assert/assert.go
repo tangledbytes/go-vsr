@@ -9,8 +9,8 @@ import "fmt"
 //
 // Assert is a no-op when compiled with the
 // release build tag.
-func Assert(cond bool, msg string) {
+func Assert(cond bool, format string, args ...any) {
 	if !cond {
-		panic(fmt.Sprintln("assertion failed:", msg))
+		panic(fmt.Sprintln("assertion failed:", fmt.Sprintf(format, args...)))
 	}
 }

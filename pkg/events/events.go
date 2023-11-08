@@ -115,25 +115,45 @@ func (ev *Event) FromReader(r io.Reader) error {
 
 	switch ev.Type {
 	case EventRequest:
-		ev.Data, err = unmarshal[Request](temp.Data)
+		var v Request
+		err = json.Unmarshal(temp.Data, &v)
+		ev.Data = v
 	case EventPrepare:
-		ev.Data, err = unmarshal[Prepare](temp.Data)
+		var v Prepare
+		err = json.Unmarshal(temp.Data, &v)
+		ev.Data = v
 	case EventPrepareOK:
-		ev.Data, err = unmarshal[PrepareOK](temp.Data)
+		var v PrepareOK
+		err = json.Unmarshal(temp.Data, &v)
+		ev.Data = v
 	case EventCommit:
-		ev.Data, err = unmarshal[Commit](temp.Data)
+		var v Commit
+		err = json.Unmarshal(temp.Data, &v)
+		ev.Data = v
 	case EventStartViewChange:
-		ev.Data, err = unmarshal[StartViewChange](temp.Data)
+		var v StartViewChange
+		err = json.Unmarshal(temp.Data, &v)
+		ev.Data = v
 	case EventDoViewChange:
-		ev.Data, err = unmarshal[DoViewChange](temp.Data)
+		var v DoViewChange
+		err = json.Unmarshal(temp.Data, &v)
+		ev.Data = v
 	case EventStartView:
-		ev.Data, err = unmarshal[StartView](temp.Data)
+		var v StartView
+		err = json.Unmarshal(temp.Data, &v)
+		ev.Data = v
 	case EventHeartbeat:
-		ev.Data, err = unmarshal[Heartbeat](temp.Data)
+		var v Heartbeat
+		err = json.Unmarshal(temp.Data, &v)
+		ev.Data = v
 	case EventReply:
-		ev.Data, err = unmarshal[Reply](temp.Data)
+		var v Reply
+		err = json.Unmarshal(temp.Data, &v)
+		ev.Data = v
 	case EventClientRequest:
-		ev.Data, err = unmarshal[ClientRequest](temp.Data)
+		var v ClientRequest
+		err = json.Unmarshal(temp.Data, &v)
+		ev.Data = v
 	default:
 		return ErrInvalidEventType
 	}
@@ -158,13 +178,4 @@ func NewNetworkEvent(src ipv4port.IPv4Port, ev *Event) NetworkEvent {
 		Src:   src,
 		Event: ev,
 	}
-}
-
-func unmarshal[T any](data json.RawMessage) (T, error) {
-	var t T
-	if err := json.Unmarshal(data, &t); err != nil {
-		return t, err
-	}
-
-	return t, nil
 }

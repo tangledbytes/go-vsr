@@ -35,7 +35,6 @@ func (ipPort IPv4Port) String() string {
 func (ipPort *IPv4Port) FromHostPort(hostport string) error {
 	ip, port, err := net.SplitHostPort(hostport)
 	if err != nil {
-		println(hostport)
 		return err
 	}
 

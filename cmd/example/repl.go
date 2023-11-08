@@ -44,9 +44,6 @@ func (r *repl) run() {
 	})
 	assert.Assert(err == nil, "err should be nil")
 
-	r.net.OnRecv(func(ne events.NetworkEvent) {
-		client.Submit(ne)
-	})
 	go r.net.Run()
 
 	waiting := false
@@ -60,6 +57,11 @@ func (r *repl) run() {
 
 			client.Submit(events.NewNetworkEvent(ipv4port.IPv4Port{}, r.eventFromCmd(cmd)))
 			waiting = true
+		}
+
+		ev, ok := r.net.Recv()
+		if ok {
+			client.Submit(ev)
 		}
 
 		client.Run()

@@ -29,35 +29,35 @@ const (
 	ReplicaStatusRecovery
 )
 
-type internalEventType = events.EventType
+type InternalEventType = events.EventType
 
 const (
-	proposeViewChange = iota + 100
+	ProposeViewChange InternalEventType = iota + 100
 )
 
-type clientTableData struct {
+type ClientTableData struct {
 	Result        string
 	RequestNumber uint64
 	Finished      bool
 }
 
-type pendingPrepareOK struct {
+type PendingPrepareOK struct {
 	ClientAddr ipv4port.IPv4Port
 	Request    events.Request
 	Responses  map[uint64]struct{}
 }
 
-type pendingStartViewChange struct {
+type PendingStartViewChange struct {
 	Responses map[uint64]struct{}
 }
 
-type pendingDoViewChange struct {
+type PendingDoViewChange struct {
 	Responses map[uint64]events.DoViewChange
 }
 
-// vsrState represents state of a single replica in the VSR cluster.
+// VSRState represents state of a single replica in the VSR cluster.
 // This replica could be Primary or Backup.
-type vsrState struct {
+type VSRState struct {
 	// ID is nothing but the index of the replica in the ClusterMembers list.
 	ID uint64
 
@@ -72,30 +72,27 @@ type vsrState struct {
 
 	// ClientTable is a map of client IDs to the last operation number
 	// that the client has seen.
-	ClientTable map[uint64]clientTableData
+	ClientTable map[uint64]ClientTableData
 
 	// ClusterMembers is a list of the cluster members IPv4:port addresses.
 	// The smallest IP address is the initial primary.
 	ClusterMembers []ipv4port.IPv4Port
 
 	// Logs is a list of the operations that have been requested by the clients.
-	//
-	// VSR has the component called opnumber, instead of opnumber we use
-	// the index of the log entry in the Logs list as the opnumber.
 	Logs log.Logs
 
 	// Status is the current status of the replica.
 	Status ReplicaStatus
 }
 
-type internal struct {
+type Internal struct {
 	// pendingPOKs keep track of all the pending prepare OKs for a particular
 	// operation number.
-	pendingPOKs map[uint64]pendingPrepareOK
+	pendingPOKs map[uint64]PendingPrepareOK
 	// pendingStartViewChange keeps track of all the pending start view change
 	// messages for a particular view number.
-	pendingStartViewChange map[uint64]pendingStartViewChange
-	pendingDoViewChange    map[uint64]pendingDoViewChange
+	pendingStartViewChange map[uint64]PendingStartViewChange
+	pendingDoViewChange    map[uint64]PendingDoViewChange
 
 	// sq is the submission queue for the events that need to be processed.
 	// everything in the replica is driven by this queue.
@@ -120,14 +117,14 @@ type internal struct {
 
 type Replica struct {
 	// state holds all the VSR related state of the replica.
-	state      vsrState
+	state      VSRState
 	network    network.Network
 	time       time.Time
 	srvhandler func(msg string) string
 
 	heartbeattimeout uint64
 
-	internal internal
+	internal Internal
 }
 
 type Config struct {
@@ -135,7 +132,7 @@ type Config struct {
 	SrvHandler       func(msg string) string
 	Network          network.Network
 	Time             time.Time
-	ID               int
+	ID               uint64
 	Members          []string
 }
 
@@ -152,23 +149,23 @@ func New(cfg Config) (*Replica, error) {
 	})
 
 	return &Replica{
-		state: vsrState{
+		state: VSRState{
 			ViewNumber:     0,
 			CommitNumber:   0,
-			ClientTable:    make(map[uint64]clientTableData),
+			ClientTable:    make(map[uint64]ClientTableData),
 			Logs:           log.NewLogs(),
 			Status:         ReplicaStatusNormal,
 			ClusterMembers: clustermembers,
-			ID:             uint64(cfg.ID),
+			ID:             cfg.ID,
 		},
 		network:          cfg.Network,
 		time:             cfg.Time,
 		srvhandler:       cfg.SrvHandler,
 		heartbeattimeout: cfg.HeartbeatTimeout,
-		internal: internal{
-			pendingPOKs:            make(map[uint64]pendingPrepareOK),
-			pendingStartViewChange: make(map[uint64]pendingStartViewChange),
-			pendingDoViewChange:    make(map[uint64]pendingDoViewChange),
+		internal: Internal{
+			pendingPOKs:            make(map[uint64]PendingPrepareOK),
+			pendingStartViewChange: make(map[uint64]PendingStartViewChange),
+			pendingDoViewChange:    make(map[uint64]PendingDoViewChange),
 			sq:                     queue.New[events.NetworkEvent](),
 			viewChangeTimeout:      cfg.Time.Now(),
 			lastPingedBackup:       make([]uint64, len(clustermembers)),
@@ -204,6 +201,16 @@ func (r *Replica) Run() {
 	r.detectViewChangeNeed()
 }
 
+// VSRState returns a copy of the VSR state of the replica.
+func (r *Replica) VSRState() VSRState {
+	return r.state
+}
+
+// InternalState returns a copy of the internal state of the replica.
+func (r *Replica) InternalState() Internal {
+	return r.internal
+}
+
 func (r *Replica) processEvent(e events.NetworkEvent) {
 	switch e.Event.Type {
 	case events.EventRequest:
@@ -216,7 +223,7 @@ func (r *Replica) processEvent(e events.NetworkEvent) {
 		r.onCommit(e.Src, e.Event.Data.(events.Commit))
 	case events.EventStartViewChange:
 		r.onStartViewChange(e.Src, e.Event.Data.(events.StartViewChange))
-	case proposeViewChange:
+	case ProposeViewChange:
 		r.initiateViewChange(r.state.ViewNumber + 1)
 	case events.EventDoViewChange:
 		r.onDoViewChange(e.Src, e.Event.Data.(events.DoViewChange))
@@ -294,7 +301,7 @@ func (r *Replica) onRequest(from ipv4port.IPv4Port, req events.Request) {
 	})
 
 	// 3. Update the client table.
-	r.state.ClientTable[req.ClientID] = clientTableData{
+	r.state.ClientTable[req.ClientID] = ClientTableData{
 		RequestNumber: client.RequestNumber,
 	}
 
@@ -314,7 +321,7 @@ func (r *Replica) onRequest(from ipv4port.IPv4Port, req events.Request) {
 	slog.Debug("sent prepare to all backups, wait for prepareOKs", "opNum", r.state.OpNum)
 
 	// 5. Wait for prepareOKs
-	r.internal.pendingPOKs[r.state.OpNum] = pendingPrepareOK{
+	r.internal.pendingPOKs[r.state.OpNum] = PendingPrepareOK{
 		Request: req,
 		Responses: map[uint64]struct{}{
 			r.state.ID: {},
@@ -379,7 +386,7 @@ func (r *Replica) onPrepare(from ipv4port.IPv4Port, ev events.Prepare) {
 	})
 
 	// 3. Update the client table
-	r.state.ClientTable[ev.Request.ClientID] = clientTableData{
+	r.state.ClientTable[ev.Request.ClientID] = ClientTableData{
 		RequestNumber: ev.Request.ClientID,
 	}
 
@@ -479,7 +486,7 @@ func (r *Replica) onPrepareOK(from ipv4port.IPv4Port, pok events.PrepareOK) {
 			// 4. Store the result in the client table
 			clientID := r.state.Logs.ClientIDAt(int(i))
 			reqID := r.state.Logs.RequestIDAt(int(i))
-			r.state.ClientTable[clientID] = clientTableData{
+			r.state.ClientTable[clientID] = ClientTableData{
 				Result:        res,
 				RequestNumber: reqID,
 				Finished:      true,
@@ -566,7 +573,7 @@ func (r *Replica) onCommit(from ipv4port.IPv4Port, commit events.Commit) {
 		// 3. Store the result in the client table
 		clientID := r.state.Logs.ClientIDAt(int(i))
 		reqID := r.state.Logs.RequestIDAt(int(i))
-		r.state.ClientTable[clientID] = clientTableData{
+		r.state.ClientTable[clientID] = ClientTableData{
 			Result:        res,
 			RequestNumber: reqID,
 			Finished:      true,
@@ -613,7 +620,7 @@ func (r *Replica) onStartViewChange(src ipv4port.IPv4Port, ev events.StartViewCh
 	if r.state.Status == ReplicaStatusViewChange && ev.ViewNum == r.state.ViewNumber {
 		_, ok := r.internal.pendingStartViewChange[ev.ViewNum]
 		if !ok {
-			r.internal.pendingStartViewChange[ev.ViewNum] = pendingStartViewChange{
+			r.internal.pendingStartViewChange[ev.ViewNum] = PendingStartViewChange{
 				Responses: map[uint64]struct{}{},
 			}
 		}
@@ -664,7 +671,7 @@ func (r *Replica) onDoViewChange(src ipv4port.IPv4Port, ev events.DoViewChange) 
 
 	_, ok := r.internal.pendingDoViewChange[ev.ViewNum]
 	if !ok {
-		r.internal.pendingDoViewChange[ev.ViewNum] = pendingDoViewChange{
+		r.internal.pendingDoViewChange[ev.ViewNum] = PendingDoViewChange{
 			Responses: map[uint64]events.DoViewChange{},
 		}
 	}
@@ -707,7 +714,7 @@ func (r *Replica) onStartView(src ipv4port.IPv4Port, ev events.StartView) {
 
 	// Send PrepareOK for all the non committed logs
 	for i := ev.CommitNum + 1; i <= ev.OpNum; i++ {
-		r.state.ClientTable[ev.Logs.ClientIDAt(int(i))] = clientTableData{
+		r.state.ClientTable[ev.Logs.ClientIDAt(int(i))] = ClientTableData{
 			RequestNumber: ev.Logs.RequestIDAt(int(i)),
 		}
 
@@ -894,11 +901,11 @@ func (r *Replica) finalizeViewChange() {
 
 	// Need to seed tables
 	for i := r.state.CommitNumber + 1; i <= r.state.OpNum; i++ {
-		r.state.ClientTable[r.state.Logs.ClientIDAt(int(i))] = clientTableData{
+		r.state.ClientTable[r.state.Logs.ClientIDAt(int(i))] = ClientTableData{
 			RequestNumber: r.state.Logs.RequestIDAt(int(i)),
 		}
 
-		r.internal.pendingPOKs[i] = pendingPrepareOK{
+		r.internal.pendingPOKs[i] = PendingPrepareOK{
 			Responses: map[uint64]struct{}{
 				r.state.ID: {},
 			},
@@ -914,7 +921,7 @@ func (r *Replica) detectViewChangeNeed() {
 		slog.Debug("primary timed out", "last heard", r.internal.viewChangeTimeout)
 		r.internal.sq.Push(events.NetworkEvent{
 			Event: &events.Event{
-				Type: internalEventType(proposeViewChange),
+				Type: InternalEventType(ProposeViewChange),
 			},
 		})
 
