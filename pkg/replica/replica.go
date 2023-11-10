@@ -27,6 +27,11 @@ const (
 	// ReplicaStatusRecovery is the state of the replica when it is
 	// recovering from a failure.
 	ReplicaStatusRecovery
+
+	// ReplicaStatusStateTransfer is a made up state which is not mentioned
+	// in the original VSR paper. This state is used to indicate that the
+	// replica is performing a state transfer.
+	ReplicaStatusStateTransfer
 )
 
 type InternalEventType = events.EventType
@@ -113,6 +118,11 @@ type Internal struct {
 	// changes in the view change protocol to the max commmit number but that
 	// doesn't mean that this replica has executed all the operations till that
 	lastExecutedOpNum uint64
+
+	getStateTimer *time.Timer
+
+	// running is a flag that indicates if the replica is running or not.
+	running bool
 }
 
 type Replica struct {
@@ -120,6 +130,7 @@ type Replica struct {
 	state      VSRState
 	network    network.Network
 	time       time.Time
+	logger     *slog.Logger
 	srvhandler func(msg string) string
 
 	heartbeattimeout uint64
@@ -134,6 +145,7 @@ type Config struct {
 	Time             time.Time
 	ID               uint64
 	Members          []string
+	Logger           *slog.Logger
 }
 
 func New(cfg Config) (*Replica, error) {
@@ -162,6 +174,7 @@ func New(cfg Config) (*Replica, error) {
 		time:             cfg.Time,
 		srvhandler:       cfg.SrvHandler,
 		heartbeattimeout: cfg.HeartbeatTimeout,
+		logger:           cfg.Logger,
 		internal: Internal{
 			pendingPOKs:            make(map[uint64]PendingPrepareOK),
 			pendingStartViewChange: make(map[uint64]PendingStartViewChange),
@@ -176,8 +189,9 @@ func New(cfg Config) (*Replica, error) {
 // Submit will submit an event to the replica. This event will be eventually
 // processed by the replica (after call to Run).
 //
-// This function is NOT thread safe.
+// This function should NOT be called from multiple threads.
 func (r *Replica) Submit(e events.NetworkEvent) {
+	assert.Assert(!r.internal.running, "replica should not be running")
 	r.internal.sq.Push(e)
 }
 
@@ -186,19 +200,16 @@ func (r *Replica) Submit(e events.NetworkEvent) {
 //
 // It needs to be run in a loop to keep processing the events.
 //
-// This function is NOT thread safe.
+// This function should NOT be called from multiple threads.
 func (r *Replica) Run() {
-	e, ok := r.internal.sq.Pop()
-	if ok {
-		r.processEvent(e)
+	assert.Assert(!r.internal.running, "replica should not be already running")
 
-		if r.isEventFromPrimary(&e) {
-			slog.Debug("got event from primary", "event", e.Event.Type)
-			r.internal.viewChangeTimeout = r.time.Now()
-		}
-	}
+	r.setIsRunning(true)
+	defer r.setIsRunning(false)
 
+	r.consumeSQ()
 	r.detectViewChangeNeed()
+	r.checkTimers()
 }
 
 // VSRState returns a copy of the VSR state of the replica.
@@ -209,6 +220,18 @@ func (r *Replica) VSRState() VSRState {
 // InternalState returns a copy of the internal state of the replica.
 func (r *Replica) InternalState() Internal {
 	return r.internal
+}
+
+func (r *Replica) consumeSQ() {
+	e, ok := r.internal.sq.Pop()
+	if ok {
+		r.processEvent(e)
+
+		if r.isEventFromPrimary(&e) {
+			r.logger.Debug("got event from primary", "event", e.Event.Type)
+			r.internal.viewChangeTimeout = r.time.Now()
+		}
+	}
 }
 
 func (r *Replica) processEvent(e events.NetworkEvent) {
@@ -229,19 +252,24 @@ func (r *Replica) processEvent(e events.NetworkEvent) {
 		r.onDoViewChange(e.Src, e.Event.Data.(events.DoViewChange))
 	case events.EventStartView:
 		r.onStartView(e.Src, e.Event.Data.(events.StartView))
+	case events.EventGetState:
+		r.onGetState(e.Src, e.Event.Data.(events.GetState))
+	case events.EventNewState:
+		r.onNewState(e.Src, e.Event.Data.(events.NewState))
 	default:
-		slog.Error("replica received an invalid event", "event", e.Event)
+		r.logger.Error("replica received an invalid event", "event", e.Event)
 	}
+
 }
 
 // onRequest handles a request from a client. This is equivalent to
 // <Request op, c, s> in the VSR-revisited paper.
 func (r *Replica) onRequest(from ipv4port.IPv4Port, req events.Request) {
-	slog.Debug("received request", "from", from.String())
+	r.logger.Debug("received request", "from", from.String())
 
 	// Am I in the state to perform the request?
 	if r.state.Status != ReplicaStatusNormal {
-		slog.Debug("not in normal state - dropping request", "state", r.state.Status)
+		r.logger.Debug("not in normal state - dropping request", "state", r.state.Status)
 		// I am not in the state to perform the request, drop the request.
 		return
 	}
@@ -252,7 +280,7 @@ func (r *Replica) onRequest(from ipv4port.IPv4Port, req events.Request) {
 	// If it does matches and I proceed with the request, I am anyway not going
 	// to get enough prepare OKs and the client request will timeout.
 	if r.state.ID != r.potentialPrimary() {
-		slog.Debug("not primary - dropping request", "id", r.state.ID, "potential primary", r.potentialPrimary())
+		r.logger.Debug("not primary - dropping request", "id", r.state.ID, "potential primary", r.potentialPrimary())
 		// I am not primary, drop the request
 
 		// TODO: Forward the request to the primary
@@ -262,17 +290,17 @@ func (r *Replica) onRequest(from ipv4port.IPv4Port, req events.Request) {
 	// Check if we have already seen this request.
 	client, ok := r.state.ClientTable[req.ClientID]
 	if ok {
-		slog.Debug("request received from known client", "client id", req.ClientID)
+		r.logger.Debug("request received from known client", "client id", req.ClientID)
 		if client.RequestNumber == req.ID {
 			// We have already seen this request, send
 			// the saved result
-			slog.Debug("request duplicate request", "client id", req.ClientID, "request id", req.ID)
+			r.logger.Debug("request duplicate request", "client id", req.ClientID, "request id", req.ID)
 
 			if client.Finished {
-				slog.Debug("request duplicate request (finished)", "client id", req.ClientID, "request id", req.ID)
+				r.logger.Debug("request duplicate request (finished)", "client id", req.ClientID, "request id", req.ID)
 
 				if err := r.sendReplyToClient(from, req.ClientID, req.ID, client.Result); err != nil {
-					slog.Error("failed to send reply to client", "err", err, "client addr", from.String())
+					r.logger.Error("failed to send reply to client", "err", err, "client addr", from.String())
 				}
 			}
 
@@ -311,14 +339,14 @@ func (r *Replica) onRequest(from ipv4port.IPv4Port, req events.Request) {
 			continue
 		}
 
-		slog.Debug("sending prepare to backup", "backup addr", member.String())
+		r.logger.Debug("sending prepare to backup", "backup addr", member.String())
 
 		if err := r.sendPrepareToBackup(member, req); err != nil {
-			slog.Error("failed to send prepare to backup", "err", err, "backup addr", member.String())
+			r.logger.Error("failed to send prepare to backup", "err", err, "backup addr", member.String())
 		}
 	}
 
-	slog.Debug("sent prepare to all backups, wait for prepareOKs", "opNum", r.state.OpNum)
+	r.logger.Debug("sent prepare to all backups, wait for prepareOKs", "opNum", r.state.OpNum)
 
 	// 5. Wait for prepareOKs
 	r.internal.pendingPOKs[r.state.OpNum] = PendingPrepareOK{
@@ -332,48 +360,42 @@ func (r *Replica) onRequest(from ipv4port.IPv4Port, req events.Request) {
 
 // onPrepare handles prepare messages sent by primary to the backups.
 func (r *Replica) onPrepare(from ipv4port.IPv4Port, ev events.Prepare) {
-	slog.Debug("received prepare", "from", from.String())
+	r.logger.Debug("received prepare", "from", from.String())
 
 	if r.state.Status != ReplicaStatusNormal {
 		// I am not in the state to process the message, drop the message.
-		slog.Debug("not in state - dropping request", "state", r.state.Status)
+		r.logger.Debug("not in state - dropping request", "state", r.state.Status)
 		return
 	}
 
 	if r.state.ID == r.potentialPrimary() {
 		// I am the primary, drop the message.
-		slog.Debug("primary - dropping request", "id", r.state.ID, "view num", r.state.ViewNumber)
+		r.logger.Debug("primary - dropping request", "id", r.state.ID, "view num", r.state.ViewNumber)
 		return
 	}
 
 	if r.state.ViewNumber > ev.ViewNum {
 		// Poor old primary is behind (or network is horrible), drop the message.
-		slog.Debug("old view number", "received view num", ev.ViewNum, "current view num", r.state.ViewNumber)
+		r.logger.Debug("old view number", "received view num", ev.ViewNum, "current view num", r.state.ViewNumber)
 		return
 	}
 
 	if r.state.ViewNumber < ev.ViewNum {
-		slog.Debug("replica lagging", "received view num", ev.ViewNum, "current view num", r.state.ViewNumber)
+		r.logger.Debug("replica lagging", "received view num", ev.ViewNum, "current view num", r.state.ViewNumber)
 
 		// I am behind, initiate a state transfer.
-		if err := r.performStateTransfer(); err != nil {
-			// If we can't perform the state transfer, drop the message.
-			return
-		}
-
-		slog.Debug("state transfer complete", "received view num", ev.ViewNum, "current view num", r.state.ViewNumber)
+		r.initiateStateTransfer(ev.ViewNum, ev.CommitNum)
+		r.logger.Debug("initiated state transfer, dropping request")
+		return
 	}
 
 	if r.state.OpNum+1 != ev.OpNum {
-		slog.Debug("replica lagging", "received op num", ev.OpNum, "current op num", r.state.OpNum)
+		r.logger.Debug("replica lagging", "received op num", ev.OpNum, "current op num", r.state.OpNum)
 
 		// I am behind, initiate a state transfer.
-		if err := r.performStateTransfer(); err != nil {
-			// If we can't perform the state transfer, drop the message.
-			return
-		}
-
-		slog.Debug("state transfer complete", "received op num", ev.OpNum, "current op num", r.state.OpNum)
+		r.initiateStateTransfer(ev.ViewNum, ev.OpNum)
+		r.logger.Debug("initiated state transfer, dropping request")
+		return
 	}
 
 	// 1. Increment the operation number.
@@ -405,11 +427,11 @@ func (r *Replica) onPrepare(from ipv4port.IPv4Port, ev events.Prepare) {
 
 	// 4. Send the PrepareOK message to the primary.
 	if err := r.sendPrepareOKToPrimary(from, ev.OpNum); err != nil {
-		slog.Error("failed to send prepareOK to primary", "err", err, "primary addr", from.String())
+		r.logger.Error("failed to send prepareOK to primary", "err", err, "primary addr", from.String())
 		return
 	}
 
-	slog.Debug("sent prepareOK to primary", "opNum", ev.OpNum)
+	r.logger.Debug("sent prepareOK to primary", "opNum", ev.OpNum)
 }
 
 // onPrepareOK handles prepare ok messages sent by the backups to the primary.
@@ -420,21 +442,21 @@ func (r *Replica) onPrepare(from ipv4port.IPv4Port, ev events.Prepare) {
 // to be invoked iff the replica is a primary. This check needs to be done by
 // the caller.
 func (r *Replica) onPrepareOK(from ipv4port.IPv4Port, pok events.PrepareOK) {
-	slog.Debug("received prepareOK", "from", from.String())
+	r.logger.Debug("received prepareOK", "from", from.String())
 
 	if r.state.Status != ReplicaStatusNormal {
-		slog.Debug("not in state - dropping request", "state", r.state.Status)
+		r.logger.Debug("not in state - dropping request", "state", r.state.Status)
 		return
 	}
 
 	if r.state.ID != r.potentialPrimary() {
-		slog.Debug("not primary - dropping request", "id", r.state.ID, "potential primary", r.potentialPrimary())
+		r.logger.Debug("not primary - dropping request", "id", r.state.ID, "potential primary", r.potentialPrimary())
 		return
 	}
 
 	// Check if this prepare OK is even relevant by checking the commit number
 	if pok.OpNum <= r.state.CommitNumber {
-		slog.Debug("prepareOK not relevant", "opNum", pok.OpNum, "commitNum", r.state.CommitNumber)
+		r.logger.Debug("prepareOK not relevant", "opNum", pok.OpNum, "commitNum", r.state.CommitNumber)
 		return
 	}
 
@@ -445,10 +467,10 @@ func (r *Replica) onPrepareOK(from ipv4port.IPv4Port, pok events.PrepareOK) {
 	if len(r.internal.pendingPOKs[pok.OpNum].Responses) > len(r.state.ClusterMembers)/2 {
 		// Process all the logs from last commit number to the op number
 		// of the prepare OK.
-		slog.Info("received prepareOK from majority", "opNum", pok.OpNum)
+		r.logger.Info("received prepareOK from majority", "opNum", pok.OpNum)
 
 		for i := r.internal.lastExecutedOpNum + 1; i <= pok.OpNum; i++ {
-			slog.Debug("processing log", "opNum", i, "log", r.state.Logs.OpAt(int(i)))
+			r.logger.Debug("processing log", "opNum", i, "log", r.state.Logs.OpAt(int(i)))
 
 			// 1. Apply the operation to the state machine
 			res := r.srvhandler(r.state.Logs.OpAt(int(i)))
@@ -467,7 +489,7 @@ func (r *Replica) onPrepareOK(from ipv4port.IPv4Port, pok events.PrepareOK) {
 					continue
 				}
 
-				slog.Debug(
+				r.logger.Debug(
 					"sending commit to backup",
 					"backup addr", member.String(),
 					"last heard", r.internal.lastPingedBackup[mi],
@@ -475,7 +497,7 @@ func (r *Replica) onPrepareOK(from ipv4port.IPv4Port, pok events.PrepareOK) {
 				)
 
 				if err := r.sendCommitToBackup(member, i); err != nil {
-					slog.Error("failed to send commit to backup",
+					r.logger.Error("failed to send commit to backup",
 						"err", err,
 						"backup addr", member.String(),
 						"opNum", i,
@@ -493,7 +515,7 @@ func (r *Replica) onPrepareOK(from ipv4port.IPv4Port, pok events.PrepareOK) {
 			}
 
 			// 5. Send the reply to the client
-			slog.Debug("sending reply to client", "client addr", r.internal.pendingPOKs[i].ClientAddr.String())
+			r.logger.Debug("sending reply to client", "client addr", r.internal.pendingPOKs[i].ClientAddr.String())
 			if r.internal.pendingPOKs[i].ClientAddr.String() != "" {
 				if err := r.sendReplyToClient(
 					r.internal.pendingPOKs[i].ClientAddr,
@@ -501,7 +523,7 @@ func (r *Replica) onPrepareOK(from ipv4port.IPv4Port, pok events.PrepareOK) {
 					reqID,
 					res,
 				); err != nil {
-					slog.Error(
+					r.logger.Error(
 						"failed to send reply to client",
 						"err", err,
 						"client addr", r.internal.pendingPOKs[i].ClientAddr.String(),
@@ -522,46 +544,40 @@ func (r *Replica) onPrepareOK(from ipv4port.IPv4Port, pok events.PrepareOK) {
 // to be invoked iff the replica is a backup. This check needs to be done by
 // the caller.
 func (r *Replica) onCommit(from ipv4port.IPv4Port, commit events.Commit) {
-	slog.Debug("received commit", "from", from.String())
+	r.logger.Debug("received commit", "from", from.String())
 
 	if r.state.Status != ReplicaStatusNormal {
-		slog.Debug("not in state - dropping request", "state", r.state.Status)
+		r.logger.Debug("not in state - dropping request", "state", r.state.Status)
 		return
 	}
 
 	if r.state.ID == r.potentialPrimary() {
-		slog.Debug("primary - dropping request", "id", r.state.ID, "view num", r.state.ViewNumber)
+		r.logger.Debug("primary - dropping request", "id", r.state.ID, "view num", r.state.ViewNumber)
 		return
 	}
 
 	if r.state.ViewNumber > commit.ViewNum {
-		slog.Debug("old view number", "received view num", commit.ViewNum, "current view num", r.state.ViewNumber)
+		r.logger.Debug("old view number", "received view num", commit.ViewNum, "current view num", r.state.ViewNumber)
 		return
 	}
 
 	if r.state.ViewNumber < commit.ViewNum {
-		slog.Debug("replica lagging", "received view num", commit.ViewNum, "current view num", r.state.ViewNumber)
-		if err := r.performStateTransfer(); err != nil {
-			slog.Error("failed to perform state transfer", "err", err)
-			return
-		}
-
-		slog.Debug("state transfer complete", "received view num", commit.ViewNum, "current view num", r.state.ViewNumber)
+		r.logger.Debug("replica lagging", "received view num", commit.ViewNum, "current view num", r.state.ViewNumber)
+		r.initiateStateTransfer(commit.ViewNum, commit.CommitNum)
+		r.logger.Debug("initiated state transfer, dropping request")
+		return
 	}
 
 	if r.state.OpNum < commit.CommitNum {
-		slog.Debug("replica lagging", "received commit num", commit.CommitNum, "current op num", r.state.OpNum)
-		if err := r.performStateTransfer(); err != nil {
-			slog.Error("failed to perform state transfer", "err", err)
-			return
-		}
-
-		slog.Debug("state transfer complete", "received commit num", commit.CommitNum, "current op num", r.state.OpNum)
+		r.logger.Debug("replica lagging", "received commit num", commit.CommitNum, "current op num", r.state.OpNum)
+		r.initiateStateTransfer(commit.ViewNum, commit.CommitNum)
+		r.logger.Debug("initiated state transfer, dropping request")
+		return
 	}
 
 	// Process all the logs from last commit number to the commit number
 	for i := r.internal.lastExecutedOpNum + 1; i <= commit.CommitNum; i++ {
-		slog.Debug("processing log", "opNum", i, "log", r.state.Logs.OpAt(int(i)))
+		r.logger.Debug("processing log", "opNum", i, "log", r.state.Logs.OpAt(int(i)))
 
 		// 1. Apply the operation to the state machine
 		res := r.srvhandler(r.state.Logs.OpAt(int(i)))
@@ -582,7 +598,7 @@ func (r *Replica) onCommit(from ipv4port.IPv4Port, commit events.Commit) {
 }
 
 func (r *Replica) onStartViewChange(src ipv4port.IPv4Port, ev events.StartViewChange) {
-	slog.Debug("received startViewChange", "from", src.String())
+	r.logger.Debug("received startViewChange", "from", src.String())
 	r.internal.viewChangeTimeout = r.time.Now()
 	// Total 6 states are possible (2 replica states) and (3 view number relations)
 
@@ -590,14 +606,14 @@ func (r *Replica) onStartViewChange(src ipv4port.IPv4Port, ev events.StartViewCh
 	// then ours
 	// TOTAL: 2
 	if ev.ViewNum < r.state.ViewNumber {
-		slog.Debug("old view number", "received view num", ev.ViewNum, "current view num", r.state.ViewNumber)
+		r.logger.Debug("old view number", "received view num", ev.ViewNum, "current view num", r.state.ViewNumber)
 		return
 	}
 
 	// Cover 1 state
 	// TOTAL: 3
 	if r.state.Status == ReplicaStatusNormal && ev.ViewNum == r.state.ViewNumber {
-		slog.Debug("old view number", "received view num", ev.ViewNum, "current view num", r.state.ViewNumber)
+		r.logger.Debug("old view number", "received view num", ev.ViewNum, "current view num", r.state.ViewNumber)
 		return
 	}
 
@@ -605,9 +621,9 @@ func (r *Replica) onStartViewChange(src ipv4port.IPv4Port, ev events.StartViewCh
 	// view change state then I need to initiate a view change.
 	//
 	// Cover 2 state
-	// TOTAL: 4
+	// TOTAL: 5
 	if ev.ViewNum > r.state.ViewNumber {
-		slog.Info("initiating view change", "received view num", ev.ViewNum, "current view num", r.state.ViewNumber)
+		r.logger.Info("initiating view change", "received view num", ev.ViewNum, "current view num", r.state.ViewNumber)
 
 		r.initiateViewChange(ev.ViewNum)
 		// Don't return here as we need to process the start view change message
@@ -616,7 +632,7 @@ func (r *Replica) onStartViewChange(src ipv4port.IPv4Port, ev events.StartViewCh
 	// Already in view change status and the view number matches
 	//
 	// Cover 1 state
-	// TOTAL: 5
+	// TOTAL: 6
 	if r.state.Status == ReplicaStatusViewChange && ev.ViewNum == r.state.ViewNumber {
 		_, ok := r.internal.pendingStartViewChange[ev.ViewNum]
 		if !ok {
@@ -629,23 +645,15 @@ func (r *Replica) onStartViewChange(src ipv4port.IPv4Port, ev events.StartViewCh
 
 		// Check if we have received view change messages from a majority of the replicas
 		if len(r.internal.pendingStartViewChange[ev.ViewNum].Responses) > len(r.state.ClusterMembers)/2 {
-			slog.Info("received view change from majority", "view num", ev.ViewNum)
+			r.logger.Info("received view change from majority", "view num", ev.ViewNum)
 
 			if err := r.sendDoViewChangeToPrimary(r.state.ClusterMembers[r.potentialPrimary()]); err != nil {
-				slog.Error("failed to send doViewChange to primary", "err", err)
+				r.logger.Error("failed to send doViewChange to primary", "err", err)
 			}
 
-			slog.Debug("sent doViewChange to primary", "view num", ev.ViewNum)
+			r.logger.Debug("sent doViewChange to primary", "view num", ev.ViewNum)
 		}
 
-		return
-	}
-
-	// Cover 1 state
-	// TOTAL: 5
-	if r.state.Status == ReplicaStatusViewChange && ev.ViewNum > r.state.ViewNumber {
-		// What happens if while being in view change state we learn of a new view?
-		assert.Assert(r.state.ViewNumber < ev.ViewNum, "view number should be higher")
 		return
 	}
 
@@ -653,11 +661,11 @@ func (r *Replica) onStartViewChange(src ipv4port.IPv4Port, ev events.StartViewCh
 }
 
 func (r *Replica) onDoViewChange(src ipv4port.IPv4Port, ev events.DoViewChange) {
-	slog.Debug("received doViewChange", "from", src.String())
+	r.logger.Debug("received doViewChange", "from", src.String())
 	r.internal.viewChangeTimeout = r.time.Now()
 
 	if r.state.Status != ReplicaStatusViewChange {
-		slog.Debug("not in state - dropping request", "state", r.state.Status)
+		r.logger.Debug("not in state - dropping request", "state", r.state.Status)
 		return
 	}
 
@@ -665,7 +673,7 @@ func (r *Replica) onDoViewChange(src ipv4port.IPv4Port, ev events.DoViewChange) 
 	// and just getting to know about it now but for sanity ensure that the
 	// view number is higher than the current view number.
 	if ev.ViewNum < r.state.ViewNumber {
-		slog.Debug("old view number", "received view num", ev.ViewNum, "current view num", r.state.ViewNumber)
+		r.logger.Debug("old view number", "received view num", ev.ViewNum, "current view num", r.state.ViewNumber)
 		return
 	}
 
@@ -680,7 +688,7 @@ func (r *Replica) onDoViewChange(src ipv4port.IPv4Port, ev events.DoViewChange) 
 
 	// Check if we have received do view change messages from a majority of the replicas
 	if len(r.internal.pendingDoViewChange[ev.ViewNum].Responses) > len(r.state.ClusterMembers)/2 {
-		slog.Info("received doViewChange from majority", "view num", ev.ViewNum)
+		r.logger.Info("received doViewChange from majority", "view num", ev.ViewNum)
 
 		r.finalizeViewChange()
 
@@ -689,21 +697,21 @@ func (r *Replica) onDoViewChange(src ipv4port.IPv4Port, ev events.DoViewChange) 
 				continue
 			}
 
-			slog.Debug("sending startView to backup", "backup addr", member.String())
+			r.logger.Debug("sending startView to backup", "backup addr", member.String())
 			if err := r.sendStartViewToBackup(member); err != nil {
-				slog.Error("failed to send startView to backup", "err", err, "backup addr", member.String())
+				r.logger.Error("failed to send startView to backup", "err", err, "backup addr", member.String())
 			}
 		}
 
-		slog.Info("view change complete", "view num", ev.ViewNum)
+		r.logger.Info("view change complete", "view num", ev.ViewNum)
 	}
 }
 
 func (r *Replica) onStartView(src ipv4port.IPv4Port, ev events.StartView) {
-	slog.Debug("received startView", "from", src.String())
+	r.logger.Debug("received startView", "from", src.String())
 
 	if ev.ViewNum < r.state.ViewNumber {
-		slog.Debug("old view number", "received view num", ev.ViewNum, "current view num", r.state.ViewNumber)
+		r.logger.Debug("old view number", "received view num", ev.ViewNum, "current view num", r.state.ViewNumber)
 		return
 	}
 
@@ -718,10 +726,10 @@ func (r *Replica) onStartView(src ipv4port.IPv4Port, ev events.StartView) {
 			RequestNumber: ev.Logs.RequestIDAt(int(i)),
 		}
 
-		slog.Debug("sending prepareOK to primary", "opNum", i)
+		r.logger.Debug("sending prepareOK to primary", "opNum", i)
 
 		if err := r.sendPrepareOKToPrimary(r.state.ClusterMembers[r.potentialPrimary()], i); err != nil {
-			slog.Error("failed to send prepareOK to primary", "err", err, "primary addr", r.state.ClusterMembers[r.potentialPrimary()].String())
+			r.logger.Error("failed to send prepareOK to primary", "err", err, "primary addr", r.state.ClusterMembers[r.potentialPrimary()].String())
 		}
 	}
 
@@ -732,22 +740,126 @@ func (r *Replica) onStartView(src ipv4port.IPv4Port, ev events.StartView) {
 	// will allow the backup to execute the operations against the state machine
 }
 
+func (r *Replica) onGetState(src ipv4port.IPv4Port, ev events.GetState) {
+	r.logger.Warn("received getState", "from", src.String(), "id", r.state.ID)
+	if r.state.Status != ReplicaStatusNormal {
+		r.logger.Warn("not in state - dropping request", "state", r.state.Status)
+		return
+	}
+
+	if r.state.ViewNumber != ev.ViewNum {
+		r.logger.Warn("not current view", "received view num", ev.ViewNum, "current view num", r.state.ViewNumber)
+		return
+	}
+
+	// Not mentioned in the paper but we need to check if the requested op number is
+	// lesser than the current op number only then we will respond with the state.
+	if r.state.OpNum < ev.OpNum {
+		r.logger.Warn("not current op num", "received op num", ev.OpNum, "current op num", r.state.OpNum, "id", r.state.ID)
+		return
+	}
+
+	if err := r.sendNewState(src, int(ev.OpNum)); err != nil {
+		r.logger.Error("failed to send newState to replica", "err", err, "replica addr", src.String())
+	}
+}
+
+func (r *Replica) onNewState(src ipv4port.IPv4Port, ev events.NewState) {
+	r.logger.Warn("received newState", "from", src.String())
+
+	if r.state.Status != ReplicaStatusStateTransfer {
+		r.logger.Debug("not in state - dropping request", "state", r.state.Status)
+		return
+	}
+
+	r.state.ViewNumber = ev.ViewNum
+	r.state.OpNum = ev.OpNum
+	r.state.Logs.Merge(ev.Logs)
+	r.state.Status = ReplicaStatusNormal
+
+	r.internal.getStateTimer = nil
+}
+
 func (r *Replica) initiateViewChange(viewnum uint64) {
-	slog.Debug("initiating view change", "view num", viewnum)
+	r.logger.Debug("initiating view change", "view num", viewnum)
 
 	r.state.Status = ReplicaStatusViewChange
 	r.internal.lastStableViewNumber = r.state.ViewNumber
 	r.state.ViewNumber = viewnum
+
+	// Remove relevant timers
+	r.internal.getStateTimer = nil
+
 	for _, member := range r.state.ClusterMembers {
-		slog.Debug("sending startViewChange to replica", "replica addr", member.String(), "view num", viewnum)
+		r.logger.Debug("sending startViewChange to replica", "replica addr", member.String(), "view num", viewnum)
 		if err := r.sendStartViewChange(member, viewnum); err != nil {
-			slog.Error("failed to send startViewChange to replica", "err", err, "replica addr", member.String())
+			r.logger.Error("failed to send startViewChange to replica", "err", err, "replica addr", member.String())
 		}
 	}
 }
 
-func (r *Replica) performStateTransfer() error {
-	panic("unimplemented")
+func (r *Replica) initiateStateTransfer(newViewNum, newOpNum uint64) {
+	r.logger.Debug(
+		"initiate state transfer",
+		"view num", newViewNum,
+		"current view num", r.state.ViewNumber,
+		"op num", newOpNum,
+		"current op num", r.state.OpNum,
+	)
+
+	if r.state.Status != ReplicaStatusNormal {
+		// Remove the timer, as we might have entered a view change state or
+		// recovery state. If a state transfer would still be needed, next calls
+		// to prepare or commit will trigger it.
+		r.internal.getStateTimer = nil
+		return
+	}
+
+	// Now that we know that we are in desired state, lets change the status of the replica
+	// to ensure that we do not process any Prepare or Commit messages while we are trying
+	// to perform the state transfer.
+	// ViewChange protocol will still be able to proceed as `onStartViewChange` does not
+	// care about any status. This is desire as we don't want to race against the state
+	// updates from view change.
+	r.state.Status = ReplicaStatusStateTransfer
+
+	if r.state.ViewNumber < newViewNum {
+		// Hard luck, gotta trucate
+		// 1. Set op number to the commit number
+		r.state.OpNum = r.state.CommitNumber
+		// 2. Truncate the logs
+		r.state.Logs.TruncateAfter(int(r.state.CommitNumber))
+	}
+
+	targetReplica := r.primaryForView(newViewNum)
+	// If the timer is set that means we have been here and probably attempted
+	// to perform the state transfer but failed. In that case we need to try
+	// the next replica in the cluster members list.
+	//
+	// NOTE: if view change protocol kicks then this timer should be removed!
+	if r.internal.getStateTimer != nil {
+		state, ok := r.internal.getStateTimer.State()
+		assert.Assert(ok, "getStateTime state should be set")
+
+		castedState := state.([3]uint64)
+		targetReplica = (castedState[2] + 1) % uint64(len(r.state.ClusterMembers))
+	}
+
+	// 3. Set the timer to ensure that we get the state within the timeout
+	r.internal.getStateTimer = time.NewTimer(r.time, 15*time.SECOND)
+	r.internal.getStateTimer.SetState([3]uint64{newViewNum, newOpNum, targetReplica})
+
+	// 4. Send GetState to the replica from which we received the request
+	//
+	// NOTE: it might be better to send the requests to every cluster member and then
+	// wait for the first response. This will ensure that we get the state from the
+	// fastest replica.
+	//
+	// This isn't done here because the logs are in memory and the simulator simply
+	// cannot manage this much memory being moved around :(
+	if err := r.sendGetStateToReplica(r.state.ClusterMembers[targetReplica]); err != nil {
+		r.logger.Error("failed to send getState to replica", "err", err, "replica addr", r.state.ClusterMembers[targetReplica].String())
+	}
 }
 
 func (r *Replica) sendPrepareToBackup(backup ipv4port.IPv4Port, req events.Request) error {
@@ -864,6 +976,38 @@ func (r *Replica) sendStartViewToBackup(backup ipv4port.IPv4Port) error {
 	})
 }
 
+func (r *Replica) sendGetStateToReplica(replica ipv4port.IPv4Port) error {
+	return r.network.Send(replica, func(w io.Writer) error {
+		ev := events.Event{
+			Type: events.EventGetState,
+			Data: events.GetState{
+				ViewNum:   r.state.ViewNumber,
+				OpNum:     r.state.OpNum,
+				ReplicaID: r.state.ID,
+			},
+		}
+
+		return ev.ToWriter(w)
+	})
+}
+
+func (r *Replica) sendNewState(replica ipv4port.IPv4Port, logsFrom int) error {
+	return r.network.Send(replica, func(w io.Writer) error {
+		ev := events.Event{
+			Type: events.EventNewState,
+			Data: events.NewState{
+				ViewNum:   r.state.ViewNumber,
+				OpNum:     r.state.OpNum,
+				CommitNum: r.state.CommitNumber,
+				Logs:      r.state.Logs.After(logsFrom),
+				ReplicaID: r.state.ID,
+			},
+		}
+
+		return ev.ToWriter(w)
+	})
+}
+
 // finalizeViewChange finalizes the view change for this node which
 // will make this node the new primary
 //
@@ -918,7 +1062,7 @@ func (r *Replica) detectViewChangeNeed() {
 		timedout(r.time.Now(), r.internal.viewChangeTimeout, r.heartbeattimeout) {
 		// This will processed next as the entire thing is single threaded
 		// nothing can be submitted to the queue while we are processing this
-		slog.Debug("primary timed out", "last heard", r.internal.viewChangeTimeout)
+		r.logger.Debug("primary timed out", "last heard", r.internal.viewChangeTimeout)
 		r.internal.sq.Push(events.NetworkEvent{
 			Event: &events.Event{
 				Type: InternalEventType(ProposeViewChange),
@@ -929,8 +1073,37 @@ func (r *Replica) detectViewChangeNeed() {
 	}
 }
 
+func (r *Replica) checkTimers() {
+	r.checkGetStateTimeout()
+}
+
+func (r *Replica) checkGetStateTimeout() {
+	if r.internal.getStateTimer == nil {
+		return
+	}
+
+	if !r.internal.getStateTimer.Done() {
+		return
+	}
+
+	state, ok := r.internal.getStateTimer.State()
+	assert.Assert(ok, "state should not be nil for getStateTimer")
+
+	// Yes, I want this to panic if the state is not of the type I expect
+	// as this is a bug in the code.
+	// The expected state is [3]uint64 - [viewNum, opNum, lastReplicaIDTried]
+	castedState := state.([3]uint64)
+
+	r.logger.Warn("getState timed out", "state", state)
+	r.initiateStateTransfer(castedState[0], castedState[1])
+}
+
 func (r *Replica) potentialPrimary() uint64 {
-	return uint64(int(r.state.ViewNumber) % len(r.state.ClusterMembers))
+	return r.primaryForView(r.state.ViewNumber)
+}
+
+func (r *Replica) primaryForView(num uint64) uint64 {
+	return uint64(int(num) % len(r.state.ClusterMembers))
 }
 
 func (r *Replica) isEventFromPrimary(e *events.NetworkEvent) bool {
@@ -961,6 +1134,10 @@ func (r *Replica) largestViewNumInPendingViewChange() uint64 {
 	}
 
 	return largest
+}
+
+func (r *Replica) setIsRunning(isRunning bool) {
+	r.internal.running = isRunning
 }
 
 func timedout(now, last, timeout uint64) bool {

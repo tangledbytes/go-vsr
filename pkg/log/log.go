@@ -34,6 +34,18 @@ func (l Logs) RequestIDAt(i int) uint64 {
 	return (l)[i-1].RequestID
 }
 
+func (l *Logs) TruncateAfter(i int) {
+	*l = (*l)[:(i - 1)]
+}
+
+func (l *Logs) After(i int) Logs {
+	return (*l)[i:]
+}
+
+func (l *Logs) Merge(logs Logs) {
+	*l = append(*l, logs...)
+}
+
 func (l *Logs) UnmarshalJSON(data []byte) error {
 	var logs []Log
 	if err := json.Unmarshal(data, &logs); err != nil {

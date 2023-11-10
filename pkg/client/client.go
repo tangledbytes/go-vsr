@@ -48,8 +48,11 @@ type Internal struct {
 type Client struct {
 	state    VSRState
 	internal Internal
-	net      network.Network
-	time     time.Time
+
+	net  network.Network
+	time time.Time
+
+	logger *slog.Logger
 }
 
 type Config struct {
@@ -58,6 +61,7 @@ type Config struct {
 	Network        network.Network
 	Time           time.Time
 	RequestTimeout uint64
+	Logger         *slog.Logger
 }
 
 // New creates a new client.
@@ -86,8 +90,9 @@ func New(cfg Config) (*Client, error) {
 			results:        queue.New[events.Reply](),
 			requestTimeout: cfg.RequestTimeout,
 		},
-		net:  cfg.Network,
-		time: cfg.Time,
+		net:    cfg.Network,
+		time:   cfg.Time,
+		logger: cfg.Logger,
 	}
 
 	return client, nil
@@ -100,7 +105,7 @@ func (c *Client) Submit(ev events.NetworkEvent) {
 	case events.EventReply:
 		c.internal.response.Push(ev.Event.Data.(events.Reply))
 	default:
-		slog.Error("Received an invalid event", "event", ev)
+		c.logger.Error("Received an invalid event", "event", ev)
 	}
 }
 
@@ -127,7 +132,7 @@ func (c *Client) Run() {
 	// Check if it has been too long since we have received a reply.
 	if c.internal.pendingRequest.request != nil && !c.internal.pendingRequest.replied {
 		if c.time.Now()-c.internal.pendingRequest.reqTime > c.internal.requestTimeout {
-			slog.Debug("client timed out waiting for a reply")
+			c.logger.Debug("client timed out waiting for a reply")
 
 			// Requeue the request for broadcast
 			c.onRequest(events.ClientRequest{
@@ -139,28 +144,28 @@ func (c *Client) Run() {
 }
 
 func (c *Client) onRequest(ev events.ClientRequest) {
-	slog.Debug("client received request to run against the cluster", "request", ev)
+	c.logger.Debug("client received request to run against the cluster", "request", ev)
 
 	c.state.RequestNumber++
 
 	if ev.Broadcast {
 		for _, v := range c.state.LastKnownClusterMembers {
 			if err := c.sendRequest(v, ev.Op); err != nil {
-				slog.Error("client failed to send request to the cluster", "err", err)
+				c.logger.Error("client failed to send request to the cluster", "err", err)
 			}
 		}
 	} else {
 		if err := c.sendRequest(c.state.LastKnownClusterMembers[c.potentialPrimary()], ev.Op); err != nil {
-			slog.Error("client failed to send request to the cluster", "err", err)
+			c.logger.Error("client failed to send request to the cluster", "err", err)
 		}
 	}
 }
 
 func (c *Client) onReply(ev events.Reply) {
-	slog.Debug("client received reply from the cluster", "reply", ev)
+	c.logger.Debug("client received reply from the cluster", "reply", ev)
 
 	if c.internal.pendingRequest.request.ID == ev.ID {
-		slog.Debug("client received reply for the pending request", "reply", ev)
+		c.logger.Debug("client received reply for the pending request", "reply", ev)
 		c.internal.pendingRequest.request = nil
 		c.internal.pendingRequest.replied = true
 

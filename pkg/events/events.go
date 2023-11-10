@@ -20,6 +20,8 @@ const (
 	EventStartViewChange
 	EventDoViewChange
 	EventStartView
+	EventGetState
+	EventNewState
 	EventHeartbeat
 
 	EventClientRequest
@@ -93,6 +95,20 @@ type StartView struct {
 	ReplicaID uint64   `json:"replica_id,string"`
 }
 
+type GetState struct {
+	ViewNum   uint64 `json:"view_num,string"`
+	OpNum     uint64 `json:"op_num,string"`
+	ReplicaID uint64 `json:"replica_id,string"`
+}
+
+type NewState struct {
+	ViewNum   uint64   `json:"view_num,string"`
+	Logs      log.Logs `json:"logs"`
+	CommitNum uint64   `json:"commit_num,string"`
+	OpNum     uint64   `json:"op_num,string"`
+	ReplicaID uint64   `json:"replica_id,string"`
+}
+
 type Heartbeat struct{}
 
 type ClientRequest struct {
@@ -140,6 +156,14 @@ func (ev *Event) FromReader(r io.Reader) error {
 		ev.Data = v
 	case EventStartView:
 		var v StartView
+		err = json.Unmarshal(temp.Data, &v)
+		ev.Data = v
+	case EventGetState:
+		var v GetState
+		err = json.Unmarshal(temp.Data, &v)
+		ev.Data = v
+	case EventNewState:
+		var v NewState
 		err = json.Unmarshal(temp.Data, &v)
 		ev.Data = v
 	case EventHeartbeat:
