@@ -36,9 +36,6 @@ jobs:
             echo "Simulation failed"
             FAIL=1
           fi
-
-          # save the output to environment variable so that we can create
-          # a github issue if the simulation failed
           echo "seed=${SEED}" >> $GITHUB_OUTPUT
           echo "output=${FAIL}" >> $GITHUB_OUTPUT
       - name: Open Issue if failed
