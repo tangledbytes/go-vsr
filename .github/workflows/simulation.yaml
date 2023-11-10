@@ -3,7 +3,7 @@ name: Continuous Simulation
 on:
   schedule:
     # * is a special character in YAML so you have to quote this string
-    - cron:  '30 5,17 * * *'
+    - cron:  '0 */3 * * *'
 
 jobs:
   simualation_test:
@@ -29,7 +29,6 @@ jobs:
 
           # save the output to environment variable so that we can create
           # a github issue if the simulation failed
-          echo "::set-env name=SIMULATION_OUTPUT::$(cat simulation_output.txt)"
           echo "seed=${SEED}" >> $GITHUB_OUTPUT
           echo "output=${FAIL}" >> $GITHUB_OUTPUT
       - name: Open Issue if failed
