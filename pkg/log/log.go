@@ -46,6 +46,10 @@ func (l *Logs) Merge(logs Logs) {
 	*l = append(*l, logs...)
 }
 
+func (l Logs) Last() Log {
+	return l[len(l)-1]
+}
+
 func (l *Logs) UnmarshalJSON(data []byte) error {
 	var logs []Log
 	if err := json.Unmarshal(data, &logs); err != nil {

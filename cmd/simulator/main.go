@@ -29,12 +29,11 @@ func saveHeapProfile() {
 }
 
 func getLogLevel(entity string) slog.Level {
-	if os.Getenv(entity+"_DEBUG") == "1" {
-		return slog.LevelDebug
-	}
 	switch os.Getenv(entity + "_DEBUG") {
 	case "1":
 		return slog.LevelDebug
+	case "0":
+		return slog.LevelInfo
 	case "-1":
 		return slog.Level(1000)
 	}

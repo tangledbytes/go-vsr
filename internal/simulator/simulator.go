@@ -144,9 +144,11 @@ func (s *Simulator) clusterProgressVerifier() func() {
 			}
 		}
 		assert.Assert(opNum > last, "expected opNum to be > %d (last), found %d", opNum, last)
-		s.logger.Info("cluster progress:", "opnum", opNum)
-		last = opNum
 
+		viewNum := findMaxViewNumber(s.replicas)
+		s.logger.Info("cluster progress:", "opnum", opNum, "viewnum", viewNum)
+
+		last = opNum
 		t.Reset()
 	})
 
@@ -156,9 +158,10 @@ func (s *Simulator) clusterProgressVerifier() func() {
 }
 
 func (r *Simulator) clusterSanityChecks() {
-	// 1. At no point any replica's opnum should be greater than its commitnum
 	for _, replica := range r.replicas {
 		state := replica.VSRState()
+
+		// 1. At no point any replica's opnum should be greater than its commitnum
 		assert.Assert(
 			state.OpNum >= state.CommitNumber,
 			"expected opNum to be <= commitNum, found opNum: %d, commitNum: %d (viewNum: %d)",
@@ -417,6 +420,18 @@ func findMaxOpNumber(replicas []*replica.Replica) uint64 {
 		state := replica.VSRState()
 		if state.OpNum > max {
 			max = state.OpNum
+		}
+	}
+
+	return max
+}
+
+func findMaxViewNumber(replicas []*replica.Replica) uint64 {
+	max := uint64(0)
+	for _, replica := range replicas {
+		state := replica.VSRState()
+		if state.ViewNumber > max {
+			max = state.ViewNumber
 		}
 	}
 
