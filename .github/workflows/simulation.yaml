@@ -25,14 +25,10 @@ jobs:
           export CLIENT_DEBUG=-1
           export SIMULATOR_DEBUG=0
           timeout 3h go run ./cmd/simulator
-          if [ $? -eq 124 ]; then
-            echo "Simulation timed out"
-            FAIL=2
-          elif [ $? -eq 0 ]; then
-            echo "Simulation finished"
-          else
-            echo "Simulation failed"
-            FAIL=1
+          exit_code=$?
+          if [ $exit_code -eq 124 ]; then echo "Simulation timed out"; FAIL=2
+          elif [ $exit_code -eq 0 ]; then echo "Simulation finished";
+          else echo "Simulation failed"; FAIL=1
           fi
           echo "seed=${SEED}" >> $GITHUB_OUTPUT
           echo "output=${FAIL}" >> $GITHUB_OUTPUT
