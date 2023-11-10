@@ -42,9 +42,13 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           SEED: ${{ steps.run_simulation.outputs.seed }}
+        with:
+          filename: .github/templates/issues/simulation_fail.md
       - name: Open Issue if timeout
         if: ${{ steps.run_simulation.outputs.output == 2 }}
         uses: JasonEtco/create-an-issue@v2
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           SEED: ${{ steps.run_simulation.outputs.seed }}
+        with:
+          filename: .github/templates/issues/simulation_timeout.md
