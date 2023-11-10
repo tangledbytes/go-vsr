@@ -1,0 +1,46 @@
+name: Continuous Simulation
+
+on:
+  schedule:
+    # * is a special character in YAML so you have to quote this string
+    - cron:  '30 5,17 * * *'
+
+jobs:
+  simualation_test:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v2
+      - name: Run simulation
+        id: run_simulation
+        run: |
+          SEED=$RANDOM
+          echo "Running simulation with $SEED"
+          timeout 3h go run ./cmd/simulator $SEED
+          if [ $? -eq 124 ]; then
+            echo "Simulation timed out"
+            FAIL=2
+          else if [ $? -eq 0 ]; then
+            echo "Simulation finished"
+          else
+            echo "Simulation failed"
+            FAIL=1
+          fi
+
+          # save the output to environment variable so that we can create
+          # a github issue if the simulation failed
+          echo "::set-env name=SIMULATION_OUTPUT::$(cat simulation_output.txt)"
+          echo "seed=${SEED}" >> $GITHUB_OUTPUT
+          echo "output=${FAIL}" >> $GITHUB_OUTPUT
+      - name: Open Issue if failed
+        if: ${{ steps.run_simulation.outputs.output == 1 }}
+        uses: JasonEtco/create-an-issue@v2
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          SEED: ${{ steps.run_simulation.outputs.seed }}
+      - name: Open Issue if timeout
+        if: ${{ steps.run_simulation.outputs.output == 2 }}
+        uses: JasonEtco/create-an-issue@v2
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          SEED: ${{ steps.run_simulation.outputs.seed }}
