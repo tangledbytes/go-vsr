@@ -3,6 +3,7 @@ package main
 import (
 	"fmt"
 	"log/slog"
+	"math/rand"
 	"os"
 	"os/signal"
 	"runtime/pprof"
@@ -81,14 +82,16 @@ func stopCPUProfile() {
 }
 
 func main() {
+	var seed int64
 	if len(os.Args) < 2 {
-		fmt.Println("seed is required")
-		return
-	}
-	seed, err := strconv.Atoi(os.Args[1])
-	if err != nil {
-		fmt.Println("invalid seed")
-		return
+		seed = rand.Int63()
+	} else {
+		var err error
+		seed, err = strconv.ParseInt(os.Args[1], 10, 64)
+		if err != nil {
+			fmt.Println("invalid seed")
+			return
+		}
 	}
 
 	setupCPUProfile()
