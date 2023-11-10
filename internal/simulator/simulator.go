@@ -4,14 +4,15 @@ import (
 	"fmt"
 	"log/slog"
 	"math/rand"
-	"os"
 
+	"github.com/tangledbytes/go-vsr/internal/simulator/constant"
 	"github.com/tangledbytes/go-vsr/pkg/assert"
 	"github.com/tangledbytes/go-vsr/pkg/client"
 	"github.com/tangledbytes/go-vsr/pkg/events"
 	"github.com/tangledbytes/go-vsr/pkg/ipv4port"
 	"github.com/tangledbytes/go-vsr/pkg/replica"
 	"github.com/tangledbytes/go-vsr/pkg/time"
+	"github.com/tangledbytes/go-vsr/pkg/utils"
 )
 
 type Simulator struct {
@@ -21,11 +22,18 @@ type Simulator struct {
 	net  *SimulatedNetworkWorld
 	time *time.Virtual
 
-	replicas      []*replica.Replica
-	replicaCfgs   []replica.Config
-	clients       []*client.Client
-	clientCfgs    []client.Config
-	replicaStores []*store
+	replicas           []*replica.Replica
+	replicaCfgs        []replica.Config
+	replicaMultipliers []int
+	replicaStores      []*store
+
+	clients           []*client.Client
+	clientCfgs        []client.Config
+	clientMultipliers []int
+
+	replicaLogger *slog.Logger
+	clientLogger  *slog.Logger
+	logger        *slog.Logger
 
 	simStore *store
 }
@@ -39,33 +47,38 @@ func (s *store) Apply(m string) string {
 	return m
 }
 
-func New(seed uint64) *Simulator {
-	time := time.NewVirtual(time.MICROSECOND) // In this world, 1 mus is 1 tick.
+func New(seed uint64, replicalogger, clientlogger, simlogger *slog.Logger) *Simulator {
+	time := time.NewVirtual(100 * time.MICROSECOND) // In this world, 1 mus is 1 tick.
 	rng := rand.New(rand.NewSource(int64(seed)))
 
 	return &Simulator{
 		rng:  rng,
 		seed: seed,
 
-		net:  NewSimulatedNetworkWorld(time, rng),
+		net:  NewSimulatedNetworkWorld(time, rng, simlogger),
 		time: time,
 
 		replicas:      make([]*replica.Replica, 0),
 		replicaCfgs:   make([]replica.Config, 0),
-		clients:       make([]*client.Client, 0),
-		clientCfgs:    make([]client.Config, 0),
 		replicaStores: make([]*store, 0),
+
+		clients:    make([]*client.Client, 0),
+		clientCfgs: make([]client.Config, 0),
+
+		replicaLogger: replicalogger,
+		clientLogger:  clientlogger,
+		logger:        simlogger,
 
 		simStore: &store{data: make(map[string]string)},
 	}
 }
 
 func (s *Simulator) Simulate() {
-	replicaCount := 1 + s.rng.Intn(20) // Ensure at least 1 replica
-	clientCount := 1 + s.rng.Intn(20)  // Ensure at least 1 client
-	reqCount := 1e4 + s.rng.Intn(1e6)  // Ensure at least 1e4 requests
+	replicaCount := utils.RandomIntRange(s.rng, constant.MIN_REPLICAS, constant.MAX_REPLICAS)
+	clientCount := utils.RandomIntRange(s.rng, constant.MIN_CLIENTS, constant.MAX_CLIENTS)
+	reqCount := utils.RandomIntRange(s.rng, constant.MIN_REQUESTS, constant.MAX_REQUESTS)
 
-	slog.Info(
+	s.logger.Info(
 		"Simulation starting",
 		"seed", s.seed,
 		"replica_count", replicaCount,
@@ -73,25 +86,25 @@ func (s *Simulator) Simulate() {
 		"request_count", reqCount,
 	)
 
-	shutuplogging()
-
 	if err := s.initializeReplicaStores(replicaCount); err != nil {
 		panic(err)
 	}
-	if err := s.initializeReplicas(clientCount); err != nil {
+	if err := s.initializeReplicas(replicaCount); err != nil {
 		panic(err)
 	}
 	if err := s.initializeClients(clientCount); err != nil {
 		panic(err)
 	}
+	progressVerifier := s.clusterProgressVerifier()
 
 	sentReq := 0
 	processedReq := 0
 	for {
-
 		s.runReplicas()
-		processedReq += s.runClients()
+		s.clusterSanityChecks()
+		progressVerifier()
 		sentReq += s.simulateRequests(sentReq, reqCount)
+		processedReq += s.runClients()
 
 		s.time.Tick()
 
@@ -101,9 +114,7 @@ func (s *Simulator) Simulate() {
 		}
 	}
 
-	resumelogging()
-
-	slog.Info(
+	s.logger.Info(
 		"Simulation complete",
 		"ticks", s.time.Now(),
 	)
@@ -111,31 +122,105 @@ func (s *Simulator) Simulate() {
 	assert.Assert(sentReq == reqCount, "sentReq should be equal to reqCount")
 
 	// Verify that cluster state is the same as our global state
-	s.verifyClusterState(replicaCount)
+	s.verifyClusterVSRState()
 }
 
-func (s *Simulator) verifyClusterState(replicaCount int) {
-	// quorum := replicaCount/2 + 1
-	// invalids := 0
-	// for k, v := range s.simStore.data {
-	// 	found := 0
-	// 	for _, store := range s.replicaStores {
-	// 		if store.data[k] == v {
-	// 			found++
-	// 		}
-	// 	}
+func (s *Simulator) clusterProgressVerifier() func() {
+	timer := time.NewTimer(s.time, 5*time.MINUTE)
+	last := uint64(0)
 
-	// 	if found < quorum {
-	// 		println("found in less than quorum:", found)
-	// 		invalids++
-	// 	}
-	// }
+	timer.Action(func(t *time.Timer) {
+		opNum := findMaxOpNumber(s.replicas)
+		if opNum == last {
+			for _, replica := range s.replicas {
+				state := replica.VSRState()
+				s.logger.Info(
+					"replica progress",
+					"viewnum", state.ViewNumber,
+					"opnum", state.OpNum,
+					"commitnum", state.CommitNumber,
+					"replicaID", state.ID,
+				)
+			}
+		}
+		assert.Assert(opNum > last, "expected opNum to be > %d (last), found %d", opNum, last)
+		s.logger.Info("cluster progress:", "opnum", opNum)
+		last = opNum
 
-	// assert.Assert(invalids == 0, "expected invalids to be 0, found %d", invalids)
+		t.Reset()
+	})
 
-	// Ensure that more than half of the replicas have same opnum
-	for i := 0; i < replicaCount; i++ {
+	return func() {
+		timer.ActIfDone()
 	}
+}
+
+func (r *Simulator) clusterSanityChecks() {
+	// 1. At no point any replica's opnum should be greater than its commitnum
+	for _, replica := range r.replicas {
+		state := replica.VSRState()
+		assert.Assert(
+			state.OpNum >= state.CommitNumber,
+			"expected opNum to be <= commitNum, found opNum: %d, commitNum: %d",
+			state.OpNum,
+			state.CommitNumber,
+		)
+	}
+}
+
+func (s *Simulator) verifyClusterVSRState() {
+	replicaCount := len(s.replicas)
+
+	quorum := replicaCount/2 + 1
+	vsrStates := make([]replica.VSRState, 0)
+	for _, replica := range s.replicas {
+		vsrStates = append(vsrStates, replica.VSRState())
+	}
+
+	viewMap := make(map[uint64]int)
+	maxViews := 0
+	opsMap := make(map[uint64]int)
+	maxOps := 0
+	for _, vsrState := range vsrStates {
+		viewMap[vsrState.ViewNumber]++
+		opsMap[vsrState.OpNum]++
+	}
+
+	// 1. Check if >= quorum of replicas have same view number
+	for _, v := range viewMap {
+		if v > maxViews {
+			maxViews = v
+		}
+	}
+	assert.Assert(maxViews >= quorum, "expected maxViews to be >= quorum, found %d", maxViews)
+	// 2. Check if >= quorum of replicas have same op number
+	for _, v := range opsMap {
+		if v > maxOps {
+			maxOps = v
+		}
+	}
+	assert.Assert(maxOps >= quorum, "expected maxOps to be >= quorum, found %d", maxOps)
+	// 3. Check if >= quorum of replicas have same commit number (?)
+	// TODO
+	// 4. Check if >= quorum of replicas have same log
+	// TODO
+	// 5. Check if >= quorum of replicas have same store (?)
+	invalids := 0
+	for k, v := range s.simStore.data {
+		found := 0
+		for _, store := range s.replicaStores {
+			if store.data[k] == v {
+				found++
+			}
+		}
+
+		if found < quorum {
+			invalids++
+		}
+	}
+
+	// simulation might end before last commit so we check for <= 1
+	assert.Assert(invalids <= 1, "expected invalids to be <=1 , found %d", invalids)
 }
 
 func (s *Simulator) runReplicas() {
@@ -149,9 +234,18 @@ func (s *Simulator) runReplicas() {
 		// Run the replica a random number of times.
 		// Hopefully simulates powerful hardware for
 		// some replicas while weaker for others?
-		for i := 0; i < s.rng.Intn(10); i++ {
+		for j := 0; j < s.replicaMultipliers[i]; j++ {
 			replica.Run()
 		}
+
+		state := replica.VSRState()
+		s.logger.Debug(
+			"VSR State",
+			"viewnum", state.ViewNumber,
+			"opnum", state.OpNum,
+			"commitnum", state.CommitNumber,
+			"replicaID", state.ID,
+		)
 	}
 }
 
@@ -167,12 +261,12 @@ func (s *Simulator) runClients() int {
 
 		// Run the clients a random number of times.
 		// Hopefully simulates more aggresseive clients
-		for i := 0; i < s.rng.Intn(10); i++ {
+		for j := 0; j < s.clientMultipliers[i]; j++ {
 			client.Run()
 			_, ok = client.CheckResult()
 			if ok {
 				processedReq++
-				println("processedReq:", processedReq)
+				s.logger.Debug("client processed request", "processed", processedReq)
 			}
 		}
 	}
@@ -221,13 +315,18 @@ func (s *Simulator) initializeClients(count int) error {
 }
 
 func (s *Simulator) initializeClientConfigs(count int) error {
+	s.clientMultipliers = make([]int, count)
+
 	for i := 0; i < count; i++ {
+		s.clientMultipliers[i] = utils.RandomIntRange(s.rng, 1, constant.MAX_CLIENT_MULTIPLIER+1)
+
 		cfg := client.Config{
 			ID:             uint64(i),
 			Network:        s.net.Node(clientAddressByID(i)),
 			Time:           s.time,
 			Members:        s.replicaCfgs[0].Members,
 			RequestTimeout: 30 * time.SECOND,
+			Logger:         s.clientLogger,
 		}
 
 		s.clientCfgs = append(s.clientCfgs, cfg)
@@ -263,7 +362,11 @@ func (s *Simulator) initializeReplicaConfigs(count int) error {
 		return err
 	}
 
+	s.replicaMultipliers = make([]int, count)
+
 	for i := 0; i < count; i++ {
+		s.replicaMultipliers[i] = utils.RandomIntRange(s.rng, 1, constant.MAX_REPLICA_MULTIPLIER+1)
+
 		cfg := replica.Config{
 			ID:               uint64(i),
 			Members:          members,
@@ -271,6 +374,7 @@ func (s *Simulator) initializeReplicaConfigs(count int) error {
 			Time:             s.time,
 			SrvHandler:       s.replicaStores[i].Apply,
 			HeartbeatTimeout: 60 * time.SECOND,
+			Logger:           s.replicaLogger,
 		}
 		s.replicaCfgs = append(s.replicaCfgs, cfg)
 	}
@@ -306,14 +410,14 @@ func clientAddressByID(id int) string {
 	return fmt.Sprintf("0.0.0.0:%d", 20000+id)
 }
 
-func shutuplogging() {
-	logh := slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{
-		Level: slog.Level(100),
-	})
-	slog.SetDefault(slog.New(logh))
-}
+func findMaxOpNumber(replicas []*replica.Replica) uint64 {
+	max := uint64(0)
+	for _, replica := range replicas {
+		state := replica.VSRState()
+		if state.OpNum > max {
+			max = state.OpNum
+		}
+	}
 
-func resumelogging() {
-	logh := slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{})
-	slog.SetDefault(slog.New(logh))
+	return max
 }

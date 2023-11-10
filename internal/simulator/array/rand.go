@@ -1,9 +1,10 @@
 package array
 
 import (
-	"context"
 	"log/slog"
 	"math/rand"
+
+	"github.com/tangledbytes/go-vsr/internal/simulator/constant"
 )
 
 type Rand[T any] struct {
@@ -12,12 +13,10 @@ type Rand[T any] struct {
 	data            []T
 }
 
-func NewRand[T any](rng *rand.Rand) *Rand[T] {
-	randpickpercent := rng.Float64() * 0.1
+func NewRand[T any](rng *rand.Rand, logger *slog.Logger) *Rand[T] {
+	randpickpercent := rng.Float64() * constant.UNORDERED_PACKET_DELIVERY_PERCENT
 
-	slog.Log(
-		context.Background(),
-		slog.Level(108),
+	logger.Info(
 		"new rand array created",
 		"rand pick percent", randpickpercent*100,
 	)
@@ -52,8 +51,8 @@ func (r *Rand[T]) popOrdered() (T, bool) {
 		return t, false
 	}
 
-	t, r.data[0] = r.data[0], r.data[len(r.data)-1]
-	r.data = r.data[:len(r.data)-1]
+	t = r.data[0]
+	r.data = r.data[1:]
 	return t, true
 }
 
@@ -63,9 +62,11 @@ func (r *Rand[T]) popRandom() (T, bool) {
 		return t, false
 	}
 
-	i := r.rng.Intn(len(r.data))
-	t, r.data[i] = r.data[i], r.data[len(r.data)-1]
+	// Only pick from the first 0.01% of the array
+	lenFirstPercent := int(float64(len(r.data)) * float64(0.01))
 
-	r.data = r.data[:len(r.data)-1]
+	i := r.rng.Intn(lenFirstPercent + 1)
+	t = r.data[i]
+	r.data = append(r.data[:i], r.data[i+1:]...)
 	return t, true
 }

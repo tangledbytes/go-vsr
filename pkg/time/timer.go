@@ -12,7 +12,7 @@ type Timer struct {
 	time  Time
 
 	state  any
-	action func(Time)
+	action func(*Timer)
 }
 
 // NewTimer takes a time and a number of ticks and returns a new timer that will
@@ -36,7 +36,7 @@ func (t *Timer) Done() bool {
 }
 
 // Action sets the action that will be executed when the timer is done
-func (t *Timer) Action(fn func(Time)) {
+func (t *Timer) Action(fn func(*Timer)) {
 	t.action = fn
 }
 
@@ -47,8 +47,8 @@ func (t *Timer) ActIfDone() bool {
 		return false
 	}
 
-	if t != nil {
-		t.action(t.time)
+	if t.action != nil {
+		t.action(t)
 	}
 
 	return true

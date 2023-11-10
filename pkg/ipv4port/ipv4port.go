@@ -5,12 +5,15 @@ import (
 	"fmt"
 	"net"
 	"strconv"
-
-	"github.com/tangledbytes/go-vsr/pkg/utils"
 )
 
 // IPv4Port is a pair of IPv4 address and port.
-type IPv4Port utils.Pair[net.IP, int]
+type IPv4Port struct {
+	First  net.IP
+	Second int
+
+	str string
+}
 
 func (ipPort IPv4Port) GetIP() net.IP {
 	return ipPort.First
@@ -22,14 +25,16 @@ func (ipPort IPv4Port) GetPort() int {
 
 func (ipPort *IPv4Port) SetIP(ip net.IP) {
 	ipPort.First = ip
+	ipPort.str = fmt.Sprintf("%s:%d", ipPort.First.String(), ipPort.Second)
 }
 
 func (ipPort *IPv4Port) SetPort(port int) {
 	ipPort.Second = port
+	ipPort.str = fmt.Sprintf("%s:%d", ipPort.First.String(), ipPort.Second)
 }
 
 func (ipPort IPv4Port) String() string {
-	return fmt.Sprintf("%s:%d", ipPort.First.String(), ipPort.Second)
+	return ipPort.str
 }
 
 func (ipPort *IPv4Port) FromHostPort(hostport string) error {
@@ -55,6 +60,7 @@ func (ipPort *IPv4Port) FromHostPort(hostport string) error {
 	ipPort.SetIP(parsedIP)
 	ipPort.SetPort(parsedPort)
 
+	ipPort.str = fmt.Sprintf("%s:%d", ipPort.First.String(), ipPort.Second)
 	return nil
 }
 
