@@ -28,20 +28,13 @@ type VSRState struct {
 	LastKnownViewNumber uint64
 }
 
-type pendingRequest struct {
-	reqTime uint64
-	request *events.Request
-	replied bool
-}
-
 type Internal struct {
-	request  *queue.Queue[events.ClientRequest]
 	response *queue.Queue[events.Reply]
-	results  *queue.Queue[events.Reply]
 
-	pendingRequest pendingRequest
-
+	request        *events.Request
+	result         *events.Reply
 	requestTimeout uint64
+	requestTimer   *time.Timer
 }
 
 // Client represents a single client of the VSR cluster.
@@ -85,9 +78,7 @@ func New(cfg Config) (*Client, error) {
 			LastKnownViewNumber:     0,
 		},
 		internal: Internal{
-			request:        queue.New[events.ClientRequest](),
 			response:       queue.New[events.Reply](),
-			results:        queue.New[events.Reply](),
 			requestTimeout: cfg.RequestTimeout,
 		},
 		net:    cfg.Network,
@@ -100,8 +91,6 @@ func New(cfg Config) (*Client, error) {
 
 func (c *Client) Submit(ev events.NetworkEvent) {
 	switch ev.Event.Type {
-	case events.EventClientRequest:
-		c.internal.request.Push(ev.Event.Data.(events.ClientRequest))
 	case events.EventReply:
 		c.internal.response.Push(ev.Event.Data.(events.Reply))
 	default:
@@ -109,17 +98,58 @@ func (c *Client) Submit(ev events.NetworkEvent) {
 	}
 }
 
+func (c *Client) Request(op string) bool {
+	if c.internal.request != nil {
+		return false
+	}
+
+	c.state.RequestNumber++
+	clusterRequest := &events.Request{
+		ID:       c.state.RequestNumber,
+		ClientID: c.state.ID,
+		Op:       op,
+	}
+
+	c.internal.request = clusterRequest
+
+	if err := c.sendRequest(c.state.LastKnownClusterMembers[c.potentialPrimary()], op); err != nil {
+		return false
+	}
+
+	c.internal.requestTimer = time.NewTimer(c.time, c.internal.requestTimeout)
+	return true
+}
+
 func (c *Client) CheckResult() (events.Reply, bool) {
-	return c.internal.results.Pop()
+	if c.internal.result == nil {
+		return events.Reply{}, false
+	}
+
+	resp := events.Reply{
+		ID:       c.internal.result.ID,
+		ClientID: c.internal.result.ClientID,
+		ViewNum:  c.internal.result.ViewNum,
+		Result:   c.internal.result.Result,
+	}
+
+	c.internal.result = nil
+	return resp, true
 }
 
 func (c *Client) Run() {
-	// Dequeue events from the internal queue if we do not have
-	// have a pending request.
-	if c.internal.pendingRequest.request == nil {
-		ev, ok := c.internal.request.Pop()
-		if ok {
-			c.onRequest(ev)
+	if c.internal.request != nil {
+		if c.internal.requestTimer.Done() {
+			c.logger.Debug("client timed out waiting for a reply")
+
+			// Request for broadcast
+			if err := c.broadcastRequest(c.internal.request.Op); err != nil {
+				c.logger.Error("client failed to broadcast request", "error", err)
+			}
+
+			// Reset the timer but don't give up the request slot yet
+			// next run will check the timer and will attempt the
+			// broadcast again.
+			c.internal.requestTimer.Reset()
 		}
 	}
 
@@ -128,49 +158,24 @@ func (c *Client) Run() {
 	if ok {
 		c.onReply(ev)
 	}
-
-	// Check if it has been too long since we have received a reply.
-	if c.internal.pendingRequest.request != nil && !c.internal.pendingRequest.replied {
-		if c.time.Now()-c.internal.pendingRequest.reqTime > c.internal.requestTimeout {
-			c.logger.Debug("client timed out waiting for a reply")
-
-			// Requeue the request for broadcast
-			c.onRequest(events.ClientRequest{
-				Op:        c.internal.pendingRequest.request.Op,
-				Broadcast: true,
-			})
-		}
-	}
-}
-
-func (c *Client) onRequest(ev events.ClientRequest) {
-	c.logger.Debug("client received request to run against the cluster", "request", ev)
-
-	c.state.RequestNumber++
-
-	if ev.Broadcast {
-		for _, v := range c.state.LastKnownClusterMembers {
-			if err := c.sendRequest(v, ev.Op); err != nil {
-				c.logger.Error("client failed to send request to the cluster", "err", err)
-			}
-		}
-	} else {
-		if err := c.sendRequest(c.state.LastKnownClusterMembers[c.potentialPrimary()], ev.Op); err != nil {
-			c.logger.Error("client failed to send request to the cluster", "err", err)
-		}
-	}
 }
 
 func (c *Client) onReply(ev events.Reply) {
 	c.logger.Debug("client received reply from the cluster", "reply", ev)
 
-	if c.internal.pendingRequest.request.ID == ev.ID {
-		c.logger.Debug("client received reply for the pending request", "reply", ev)
-		c.internal.pendingRequest.request = nil
-		c.internal.pendingRequest.replied = true
+	// No requests were pending, why am I here? Probably a duplicate or
+	// delayed reply.
+	if c.internal.request == nil {
+		c.logger.Debug("client received a reply but no request was pending", "reply", ev)
+		return
+	}
 
+	if c.internal.request.ID == ev.ID {
+		c.logger.Debug("client received reply for the pending request", "reply", ev)
+		c.internal.request = nil
+		c.internal.result = &ev
 		c.state.LastKnownViewNumber = ev.ViewNum
-		c.internal.results.Push(ev)
+		c.internal.requestTimer = nil
 	}
 }
 
@@ -181,17 +186,26 @@ func (c *Client) sendRequest(to ipv4port.IPv4Port, op string) error {
 		Op:       op,
 	}
 
-	c.internal.pendingRequest = pendingRequest{
-		reqTime: c.time.Now(),
-		request: &req,
-	}
-
 	return c.net.Send(to, func(w io.Writer) error {
 		return (&events.Event{
 			Type: events.EventRequest,
 			Data: req,
 		}).ToWriter(w)
 	})
+}
+
+func (c *Client) broadcastRequest(op string) error {
+	for mi, member := range c.state.LastKnownClusterMembers {
+		if mi == int(c.state.ID) {
+			continue
+		}
+
+		if err := c.sendRequest(member, op); err != nil {
+			return err
+		}
+	}
+
+	return nil
 }
 
 func (c *Client) potentialPrimary() uint64 {

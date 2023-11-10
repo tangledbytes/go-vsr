@@ -8,8 +8,6 @@ import (
 	"github.com/tangledbytes/go-vsr/internal/simulator/constant"
 	"github.com/tangledbytes/go-vsr/pkg/assert"
 	"github.com/tangledbytes/go-vsr/pkg/client"
-	"github.com/tangledbytes/go-vsr/pkg/events"
-	"github.com/tangledbytes/go-vsr/pkg/ipv4port"
 	"github.com/tangledbytes/go-vsr/pkg/replica"
 	"github.com/tangledbytes/go-vsr/pkg/time"
 	"github.com/tangledbytes/go-vsr/pkg/utils"
@@ -95,10 +93,10 @@ func (s *Simulator) Simulate() {
 	if err := s.initializeClients(clientCount); err != nil {
 		panic(err)
 	}
-	progressVerifier := s.clusterProgressVerifier()
 
 	sentReq := 0
 	processedReq := 0
+	progressVerifier := s.clusterProgressVerifier(&sentReq, &processedReq)
 	for {
 		s.runReplicas()
 		s.clusterSanityChecks()
@@ -125,8 +123,8 @@ func (s *Simulator) Simulate() {
 	s.verifyClusterVSRState()
 }
 
-func (s *Simulator) clusterProgressVerifier() func() {
-	timer := time.NewTimer(s.time, 5*time.MINUTE)
+func (s *Simulator) clusterProgressVerifier(sentReq, processedReq *int) func() {
+	timer := time.NewTimer(s.time, 10*time.MINUTE)
 	last := uint64(0)
 
 	timer.Action(func(t *time.Timer) {
@@ -146,7 +144,13 @@ func (s *Simulator) clusterProgressVerifier() func() {
 		assert.Assert(opNum > last, "expected opNum to be > %d (last), found %d", opNum, last)
 
 		viewNum := findMaxViewNumber(s.replicas)
-		s.logger.Info("cluster progress:", "opnum", opNum, "viewnum", viewNum)
+		s.logger.Info(
+			"cluster progress:",
+			"opnum", opNum,
+			"viewnum", viewNum,
+			"sent req", *sentReq,
+			"processed req", *processedReq,
+		)
 
 		last = opNum
 		t.Reset()
@@ -164,10 +168,11 @@ func (r *Simulator) clusterSanityChecks() {
 		// 1. At no point any replica's opnum should be greater than its commitnum
 		assert.Assert(
 			state.OpNum >= state.CommitNumber,
-			"expected opNum to be <= commitNum, found opNum: %d, commitNum: %d (viewNum: %d)",
+			"expected opNum to be <= commitNum, found opNum: %d, commitNum: %d (viewNum: %d, replicaID: %d)",
 			state.OpNum,
 			state.CommitNumber,
 			state.ViewNumber,
+			state.ID,
 		)
 	}
 }
@@ -280,22 +285,24 @@ func (s *Simulator) runClients() int {
 
 func (s *Simulator) simulateRequests(sentReq, reqCount int) int {
 	if sentReq < reqCount {
-		reqbatch := s.rng.Intn(100)
+		reqbatch := utils.RandomIntRange(s.rng, 0, 101)
 		if reqbatch > reqCount-sentReq {
 			reqbatch = reqCount - sentReq
 		}
 
+		success := 0
 		for i := 0; i < reqbatch; i++ {
 			cID := s.rng.Intn(len(s.clients))
 			client := s.clients[cID]
 
 			key := fmt.Sprintf("entry-%d", s.rng.Int())
-			s.simStore.Apply(key)
-
-			sendRequest(client, key)
+			if client.Request(key) {
+				s.simStore.Apply(key)
+				success += 1
+			}
 		}
 
-		return reqbatch
+		return success
 	}
 
 	return 0
@@ -392,18 +399,6 @@ func (s *Simulator) initializeReplicaStores(count int) error {
 	}
 
 	return nil
-}
-
-func sendRequest(c *client.Client, data string) {
-	c.Submit(events.NewNetworkEvent(
-		ipv4port.IPv4Port{},
-		&events.Event{
-			Type: events.EventClientRequest,
-			Data: events.ClientRequest{
-				Op: data,
-			},
-		},
-	))
 }
 
 func replicaAddressByID(id int) string {

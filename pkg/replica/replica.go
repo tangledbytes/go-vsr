@@ -97,18 +97,14 @@ type Internal struct {
 	// pendingStartViewChange keeps track of all the pending start view change
 	// messages for a particular view number.
 	pendingStartViewChange map[uint64]PendingStartViewChange
-	pendingDoViewChange    map[uint64]PendingDoViewChange
+	// pendingDoViewChange keeps track of all the pending do view change
+	// messages for a particular view number.
+	pendingDoViewChange map[uint64]PendingDoViewChange
 
 	// sq is the submission queue for the events that need to be processed.
 	// everything in the replica is driven by this queue.
 	sq *queue.Queue[events.NetworkEvent]
 
-	// viewChangeTimeout is the last time when the replica heard from the
-	// primary. This is only relevant for the backups.
-	viewChangeTimeout uint64
-	// lastPingedBackup is the last time when the replica pinged the backup.
-	// This is only relevant for the primary.
-	lastPingedBackup []uint64
 	// lastStableViewNumber is the last view number when the replica was in
 	// stable state.
 	lastStableViewNumber uint64
@@ -119,7 +115,17 @@ type Internal struct {
 	// doesn't mean that this replica has executed all the operations till that
 	lastExecutedOpNum uint64
 
+	// viewChangeTimer is used to detect if the replica needs to initiate a
+	// view change or not.
+	viewChangeTimer *time.Timer
+	// getStateTimer keeps track of the time when the replica might needs
+	// to send another getState request to another replica as it didn't
+	// hear from the previous replica.
 	getStateTimer *time.Timer
+	// commitTimer keeps track of the time when the primary (current) sent
+	// the last commit message to the backups. If the primary didn't send
+	// any commit message for a certain amount of time, it will do again.
+	commitTimer *time.Timer
 
 	// running is a flag that indicates if the replica is running or not.
 	running bool
@@ -180,8 +186,9 @@ func New(cfg Config) (*Replica, error) {
 			pendingStartViewChange: make(map[uint64]PendingStartViewChange),
 			pendingDoViewChange:    make(map[uint64]PendingDoViewChange),
 			sq:                     queue.New[events.NetworkEvent](),
-			viewChangeTimeout:      cfg.Time.Now(),
-			lastPingedBackup:       make([]uint64, len(clustermembers)),
+
+			commitTimer:     time.NewTimer(cfg.Time, cfg.HeartbeatTimeout),
+			viewChangeTimer: time.NewTimer(cfg.Time, cfg.HeartbeatTimeout*2),
 		},
 	}, nil
 }
@@ -208,7 +215,6 @@ func (r *Replica) Run() {
 	defer r.setIsRunning(false)
 
 	r.consumeSQ()
-	r.detectViewChangeNeed()
 	r.checkTimers()
 }
 
@@ -229,7 +235,7 @@ func (r *Replica) consumeSQ() {
 
 		if r.isEventFromPrimary(&e) {
 			r.logger.Debug("got event from primary", "event", e.Event.Type)
-			r.internal.viewChangeTimeout = r.time.Now()
+			r.internal.viewChangeTimer.Reset()
 		}
 	}
 }
@@ -259,13 +265,12 @@ func (r *Replica) processEvent(e events.NetworkEvent) {
 	default:
 		r.logger.Error("replica received an invalid event", "event", e.Event)
 	}
-
 }
 
 // onRequest handles a request from a client. This is equivalent to
 // <Request op, c, s> in the VSR-revisited paper.
 func (r *Replica) onRequest(from ipv4port.IPv4Port, req events.Request) {
-	r.logger.Debug("received request", "from", from.String())
+	r.logger.Debug("received request", "from", from.String(), "replica id", r.state.ID)
 
 	// Am I in the state to perform the request?
 	if r.state.Status != ReplicaStatusNormal {
@@ -360,7 +365,7 @@ func (r *Replica) onRequest(from ipv4port.IPv4Port, req events.Request) {
 
 // onPrepare handles prepare messages sent by primary to the backups.
 func (r *Replica) onPrepare(from ipv4port.IPv4Port, ev events.Prepare) {
-	r.logger.Debug("received prepare", "from", from.String())
+	r.logger.Debug("received prepare", "from", from.String(), "replica id", r.state.ID)
 
 	if r.state.Status != ReplicaStatusNormal {
 		// I am not in the state to process the message, drop the message.
@@ -442,7 +447,7 @@ func (r *Replica) onPrepare(from ipv4port.IPv4Port, ev events.Prepare) {
 // to be invoked iff the replica is a primary. This check needs to be done by
 // the caller.
 func (r *Replica) onPrepareOK(from ipv4port.IPv4Port, pok events.PrepareOK) {
-	r.logger.Debug("received prepareOK", "from", from.String())
+	r.logger.Debug("received prepareOK", "from", from.String(), "replica id", r.state.ID)
 
 	if r.state.Status != ReplicaStatusNormal {
 		r.logger.Debug("not in state - dropping request", "state", r.state.Status)
@@ -485,17 +490,7 @@ func (r *Replica) onPrepareOK(from ipv4port.IPv4Port, pok events.PrepareOK) {
 					continue
 				}
 
-				if r.time.Now()-r.internal.lastPingedBackup[mi] < r.heartbeattimeout {
-					continue
-				}
-
-				r.logger.Debug(
-					"sending commit to backup",
-					"backup addr", member.String(),
-					"last heard", r.internal.lastPingedBackup[mi],
-					"opNum", i,
-				)
-
+				// Send commits - not mentioned in the paper
 				if err := r.sendCommitToBackup(member, i); err != nil {
 					r.logger.Error("failed to send commit to backup",
 						"err", err,
@@ -544,7 +539,7 @@ func (r *Replica) onPrepareOK(from ipv4port.IPv4Port, pok events.PrepareOK) {
 // to be invoked iff the replica is a backup. This check needs to be done by
 // the caller.
 func (r *Replica) onCommit(from ipv4port.IPv4Port, commit events.Commit) {
-	r.logger.Debug("received commit", "from", from.String())
+	r.logger.Debug("received commit", "from", from.String(), "replica id", r.state.ID)
 
 	if r.state.Status != ReplicaStatusNormal {
 		r.logger.Debug("not in state - dropping request", "state", r.state.Status)
@@ -598,8 +593,8 @@ func (r *Replica) onCommit(from ipv4port.IPv4Port, commit events.Commit) {
 }
 
 func (r *Replica) onStartViewChange(src ipv4port.IPv4Port, ev events.StartViewChange) {
-	r.logger.Debug("received startViewChange", "from", src.String())
-	r.internal.viewChangeTimeout = r.time.Now()
+	r.logger.Debug("received startViewChange", "from", src.String(), "replica id", r.state.ID)
+	r.internal.viewChangeTimer.Reset()
 	// Total 6 states are possible (2 replica states) and (3 view number relations)
 
 	// Cover 2 states, normal and view change when the view number is lesser
@@ -661,8 +656,8 @@ func (r *Replica) onStartViewChange(src ipv4port.IPv4Port, ev events.StartViewCh
 }
 
 func (r *Replica) onDoViewChange(src ipv4port.IPv4Port, ev events.DoViewChange) {
-	r.logger.Debug("received doViewChange", "from", src.String())
-	r.internal.viewChangeTimeout = r.time.Now()
+	r.logger.Debug("received doViewChange", "from", src.String(), "replica id", r.state.ID)
+	r.internal.viewChangeTimer.Reset()
 
 	if r.state.Status != ReplicaStatusViewChange {
 		r.logger.Debug("not in state - dropping request", "state", r.state.Status)
@@ -708,13 +703,14 @@ func (r *Replica) onDoViewChange(src ipv4port.IPv4Port, ev events.DoViewChange) 
 }
 
 func (r *Replica) onStartView(src ipv4port.IPv4Port, ev events.StartView) {
-	r.logger.Debug("received startView", "from", src.String())
+	r.logger.Debug("received startView", "from", src.String(), "replica id", r.state.ID)
 
 	if ev.ViewNum < r.state.ViewNumber {
 		r.logger.Debug("old view number", "received view num", ev.ViewNum, "current view num", r.state.ViewNumber)
 		return
 	}
 
+	r.state.OpNum = ev.OpNum
 	r.state.Logs = ev.Logs
 	r.state.CommitNumber = ev.CommitNum
 	r.state.ViewNumber = ev.ViewNum
@@ -741,7 +737,7 @@ func (r *Replica) onStartView(src ipv4port.IPv4Port, ev events.StartView) {
 }
 
 func (r *Replica) onGetState(src ipv4port.IPv4Port, ev events.GetState) {
-	r.logger.Warn("received getState", "from", src.String(), "id", r.state.ID)
+	r.logger.Warn("received getState", "from", src.String(), "replica id", r.state.ID)
 	if r.state.Status != ReplicaStatusNormal {
 		r.logger.Warn("not in state - dropping request", "state", r.state.Status)
 		return
@@ -765,7 +761,7 @@ func (r *Replica) onGetState(src ipv4port.IPv4Port, ev events.GetState) {
 }
 
 func (r *Replica) onNewState(src ipv4port.IPv4Port, ev events.NewState) {
-	r.logger.Warn("received newState", "from", src.String())
+	r.logger.Warn("received newState", "from", src.String(), "replica id", r.state.ID)
 
 	if r.state.Status != ReplicaStatusStateTransfer {
 		r.logger.Debug("not in state - dropping request", "state", r.state.Status)
@@ -863,7 +859,6 @@ func (r *Replica) initiateStateTransfer(newViewNum, newOpNum uint64) {
 }
 
 func (r *Replica) sendPrepareToBackup(backup ipv4port.IPv4Port, req events.Request) error {
-	r.internal.lastPingedBackup[findIDForAddr(r.state.ClusterMembers, backup)] = r.time.Now()
 	return r.network.Send(backup, func(w io.Writer) error {
 		ev := events.Event{
 			Type: events.EventPrepare,
@@ -912,7 +907,6 @@ func (r *Replica) sendPrepareOKToPrimary(primary ipv4port.IPv4Port, opnum uint64
 }
 
 func (r *Replica) sendCommitToBackup(backup ipv4port.IPv4Port, commitnum uint64) error {
-	r.internal.lastPingedBackup[findIDForAddr(r.state.ClusterMembers, backup)] = r.time.Now()
 	return r.network.Send(backup, func(w io.Writer) error {
 		ev := events.Event{
 			Type: events.EventCommit,
@@ -1058,24 +1052,57 @@ func (r *Replica) finalizeViewChange() {
 	}
 }
 
-func (r *Replica) detectViewChangeNeed() {
-	if r.potentialPrimary() != r.state.ID &&
-		timedout(r.time.Now(), r.internal.viewChangeTimeout, r.heartbeattimeout) {
-		// This will processed next as the entire thing is single threaded
-		// nothing can be submitted to the queue while we are processing this
-		r.logger.Debug("primary timed out", "last heard", r.internal.viewChangeTimeout)
-		r.internal.sq.Push(events.NetworkEvent{
-			Event: &events.Event{
-				Type: InternalEventType(ProposeViewChange),
-			},
-		})
-
-		r.internal.viewChangeTimeout = r.time.Now()
-	}
-}
-
 func (r *Replica) checkTimers() {
 	r.checkGetStateTimeout()
+	r.checkCommitTimeout()
+	r.checkViewChangeTimer()
+}
+
+func (r *Replica) checkViewChangeTimer() {
+	if r.potentialPrimary() != r.state.ID {
+		return
+	}
+
+	if !r.internal.viewChangeTimer.Done() {
+		return
+	}
+
+	r.logger.Debug("view change timer timed out", "view num", r.state.ViewNumber)
+	r.internal.sq.Push(events.NetworkEvent{
+		Event: &events.Event{
+			Type: InternalEventType(ProposeViewChange),
+		},
+	})
+
+	r.internal.viewChangeTimer.Reset()
+}
+
+func (r *Replica) checkCommitTimeout() {
+	if !r.internal.commitTimer.Done() {
+		return
+	}
+
+	if r.state.ID != r.potentialPrimary() {
+		return
+	}
+
+	r.logger.Debug(
+		"broadcasting commit message",
+		"commit num", r.state.CommitNumber,
+		"view num", r.state.ViewNumber,
+		"replica id", r.state.ID,
+	)
+
+	for mi, member := range r.state.ClusterMembers {
+		if r.state.ID == uint64(mi) {
+			continue
+		}
+
+		// It's OK if the broadcast fails
+		r.sendCommitToBackup(member, r.state.CommitNumber)
+	}
+
+	r.internal.commitTimer.Reset()
 }
 
 func (r *Replica) checkGetStateTimeout() {
@@ -1139,18 +1166,4 @@ func (r *Replica) largestViewNumInPendingViewChange() uint64 {
 
 func (r *Replica) setIsRunning(isRunning bool) {
 	r.internal.running = isRunning
-}
-
-func timedout(now, last, timeout uint64) bool {
-	return now-last > timeout
-}
-
-func findIDForAddr(members []ipv4port.IPv4Port, addr ipv4port.IPv4Port) int {
-	for i, v := range members {
-		if v.String() == addr.String() {
-			return i
-		}
-	}
-
-	return -1
 }

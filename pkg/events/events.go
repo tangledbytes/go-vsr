@@ -23,8 +23,6 @@ const (
 	EventGetState
 	EventNewState
 	EventHeartbeat
-
-	EventClientRequest
 )
 
 // ErrInvalidEventType is returned when an invalid event type is encountered.
@@ -111,11 +109,6 @@ type NewState struct {
 
 type Heartbeat struct{}
 
-type ClientRequest struct {
-	Op        string `json:"op"`
-	Broadcast bool   `json:"broadcast"`
-}
-
 func (ev *Event) FromReader(r io.Reader) error {
 	temp := struct {
 		Type EventType       `json:"@type"`
@@ -172,10 +165,6 @@ func (ev *Event) FromReader(r io.Reader) error {
 		ev.Data = v
 	case EventReply:
 		var v Reply
-		err = json.Unmarshal(temp.Data, &v)
-		ev.Data = v
-	case EventClientRequest:
-		var v ClientRequest
 		err = json.Unmarshal(temp.Data, &v)
 		ev.Data = v
 	default:
