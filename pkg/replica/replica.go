@@ -1039,6 +1039,7 @@ func (r *Replica) finalizeViewChange() {
 		}
 	}
 
+	r.state.OpNum = bestOpNum
 	r.state.Logs = bestLogs
 	r.state.CommitNumber = bestCommit
 	r.state.Status = ReplicaStatusNormal

@@ -161,9 +161,10 @@ func (r *Simulator) clusterSanityChecks() {
 		state := replica.VSRState()
 		assert.Assert(
 			state.OpNum >= state.CommitNumber,
-			"expected opNum to be <= commitNum, found opNum: %d, commitNum: %d",
+			"expected opNum to be <= commitNum, found opNum: %d, commitNum: %d (viewNum: %d)",
 			state.OpNum,
 			state.CommitNumber,
+			state.ViewNumber,
 		)
 	}
 }
