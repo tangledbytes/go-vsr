@@ -8,8 +8,6 @@ import (
 
 	"github.com/tangledbytes/go-vsr/pkg/assert"
 	"github.com/tangledbytes/go-vsr/pkg/client"
-	"github.com/tangledbytes/go-vsr/pkg/events"
-	"github.com/tangledbytes/go-vsr/pkg/ipv4port"
 	"github.com/tangledbytes/go-vsr/pkg/network"
 	"github.com/tangledbytes/go-vsr/pkg/time"
 )
@@ -55,7 +53,7 @@ func (r *repl) run() {
 				continue
 			}
 
-			client.Submit(events.NewNetworkEvent(ipv4port.IPv4Port{}, r.eventFromCmd(cmd)))
+			client.Request(cmd)
 			waiting = true
 		}
 
@@ -84,13 +82,4 @@ func (r *repl) acceptinput() (string, bool) {
 	buf := bufio.NewReader(os.Stdin)
 	cmd, err := buf.ReadString('\n')
 	return strings.TrimSpace(cmd), err == nil
-}
-
-func (r *repl) eventFromCmd(cmd string) *events.Event {
-	return &events.Event{
-		Type: events.EventClientRequest,
-		Data: events.ClientRequest{
-			Op: cmd,
-		},
-	}
 }
