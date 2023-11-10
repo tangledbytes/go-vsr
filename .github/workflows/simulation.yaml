@@ -21,6 +21,11 @@ jobs:
         run: |
           SEED=$RANDOM
           echo "Running simulation with $SEED"
+          CPU_PROFILE=0
+          HEAP_PROFILE=0
+          REPLICA_DEBUG=-1
+          CLIENT_DEBUG=-1
+          SIMULATOR_DEBUG=0
           timeout 3h go run ./cmd/simulator $SEED
           if [ $? -eq 124 ]; then
             echo "Simulation timed out"
