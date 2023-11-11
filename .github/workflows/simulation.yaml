@@ -41,8 +41,8 @@ jobs:
         if: ${{ steps.run_simulation.outputs.output == 1 }}
         with:
           route: POST /repos/{owner}/{repo}/issues
-          owner: ${{ github.repository_owner }}
-          repo: ${{ github.event.repository.name }}
+          owner: tangledbytes
+          repo: go-vsr
           title: Simulation failed for seed `${{ steps.run_simulation.outputs.seed }}`
           labels: "auto-simulation"
         env:
@@ -52,8 +52,8 @@ jobs:
         if: ${{ steps.run_simulation.outputs.output == 2 }}
         with:
           route: POST /repos/{owner}/{repo}/issues
-          owner: ${{ github.repository_owner }}
-          repo: ${{ github.event.repository.name }}
+          owner: tangledbytes
+          repo: go-vsr
           title: Simulation timedout for seed `${{ steps.run_simulation.outputs.seed }}`
           labels: "auto-simulation"
         env:
