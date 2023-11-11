@@ -4,6 +4,9 @@ on:
   schedule:
     # * is a special character in YAML so you have to quote this string
     - cron:  '*/10 * * * *'
+  push:
+    branches:
+      - master
   workflow_dispatch:
 
 jobs:
@@ -33,19 +36,25 @@ jobs:
           fi
           echo "seed=${SEED}" >> $GITHUB_OUTPUT
           echo "output=${FAIL}" >> $GITHUB_OUTPUT
-      - name: Open Issue if failed
+      - name: GH API open issue if failed
+        uses: octokit/request-action@v2.x
         if: ${{ steps.run_simulation.outputs.output == 1 }}
-        uses: JasonEtco/create-an-issue@v2
+        with:
+          route: POST /repos/{owner}/{repo}/issues
+          owner: ${{ github.repository_owner }}
+          repo: ${{ github.event.repository.name }}
+          title: Simulation failed for seed `${{ steps.run_simulation.outputs.seed }}`
+          labels: "auto-simulation"
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          SEED: ${{ steps.run_simulation.outputs.seed }}
-        with:
-          filename: .github/templates/issues/simulation_fail.md
-      - name: Open Issue if timeout
+      - name: GH API open issue if timedout
+        uses: octokit/request-action@v2.x
         if: ${{ steps.run_simulation.outputs.output == 2 }}
-        uses: JasonEtco/create-an-issue@v2
+        with:
+          route: POST /repos/{owner}/{repo}/issues
+          owner: ${{ github.repository_owner }}
+          repo: ${{ github.event.repository.name }}
+          title: Simulation timedout for seed `${{ steps.run_simulation.outputs.seed }}`
+          labels: "auto-simulation"
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          SEED: ${{ steps.run_simulation.outputs.seed }}
-        with:
-          filename: .github/templates/issues/simulation_timeout.md
