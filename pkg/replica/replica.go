@@ -354,13 +354,17 @@ func (r *Replica) onRequest(from ipv4port.IPv4Port, req events.Request) {
 	r.logger.Debug("sent prepare to all backups, wait for prepareOKs", "opNum", r.state.OpNum)
 
 	// 5. Wait for prepareOKs
-	r.internal.pendingPOKs[r.state.OpNum] = PendingPrepareOK{
-		Request: req,
-		Responses: map[uint64]struct{}{
-			r.state.ID: {},
+	r.internal.sq.Push(events.NetworkEvent{
+		Src: r.state.ClusterMembers[r.state.ID],
+		Event: &events.Event{
+			Type: events.EventPrepareOK,
+			Data: events.PrepareOK{
+				ViewNum:   r.state.ViewNumber,
+				OpNum:     r.state.OpNum,
+				ReplicaID: r.state.ID,
+			},
 		},
-		ClientAddr: from,
-	}
+	})
 }
 
 // onPrepare handles prepare messages sent by primary to the backups.
@@ -463,6 +467,12 @@ func (r *Replica) onPrepareOK(from ipv4port.IPv4Port, pok events.PrepareOK) {
 	if pok.OpNum <= r.state.CommitNumber {
 		r.logger.Debug("prepareOK not relevant", "opNum", pok.OpNum, "commitNum", r.state.CommitNumber)
 		return
+	}
+
+	if _, ok := r.internal.pendingPOKs[pok.OpNum]; !ok {
+		r.internal.pendingPOKs[pok.OpNum] = PendingPrepareOK{
+			Responses: map[uint64]struct{}{},
+		}
 	}
 
 	// Record the prepare OK
@@ -1059,7 +1069,8 @@ func (r *Replica) checkTimers() {
 }
 
 func (r *Replica) checkViewChangeTimer() {
-	if r.potentialPrimary() != r.state.ID {
+	// No need to perform view change if I am the primary
+	if r.potentialPrimary() == r.state.ID {
 		return
 	}
 

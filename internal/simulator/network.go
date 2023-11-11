@@ -61,7 +61,7 @@ func (r *Routes) AddPacket(src, dest string, ev events.NetworkEvent) bool {
 
 		dupspercent := r.rng.Float64() * constant.PACKET_DUPS_PERCENT
 		droppercent := r.rng.Float64() * constant.PACKET_DROP_PERCENT
-		r.logger.Info(
+		r.logger.Debug(
 			"new route created",
 			"drop percent", droppercent*100,
 			"dups percent", dupspercent*100,
