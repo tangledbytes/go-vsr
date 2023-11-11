@@ -38,6 +38,7 @@ type InternalEventType = events.EventType
 
 const (
 	ProposeViewChange InternalEventType = iota + 100
+	InternalPrepareOK
 )
 
 type ClientTableData struct {
@@ -58,6 +59,12 @@ type PendingStartViewChange struct {
 
 type PendingDoViewChange struct {
 	Responses map[uint64]events.DoViewChange
+}
+
+type InternalPrepareOKData struct {
+	pok        events.PrepareOK
+	req        events.Request
+	clientaddr ipv4port.IPv4Port
 }
 
 // VSRState represents state of a single replica in the VSR cluster.
@@ -248,6 +255,8 @@ func (r *Replica) processEvent(e events.NetworkEvent) {
 		r.onPrepare(e.Src, e.Event.Data.(events.Prepare))
 	case events.EventPrepareOK:
 		r.onPrepareOK(e.Src, e.Event.Data.(events.PrepareOK))
+	case InternalPrepareOK:
+		r.onInternalPrepareOK(e.Src, e.Event.Data.(InternalPrepareOKData))
 	case events.EventCommit:
 		r.onCommit(e.Src, e.Event.Data.(events.Commit))
 	case events.EventStartViewChange:
@@ -357,11 +366,15 @@ func (r *Replica) onRequest(from ipv4port.IPv4Port, req events.Request) {
 	r.internal.sq.Push(events.NetworkEvent{
 		Src: r.state.ClusterMembers[r.state.ID],
 		Event: &events.Event{
-			Type: events.EventPrepareOK,
-			Data: events.PrepareOK{
-				ViewNum:   r.state.ViewNumber,
-				OpNum:     r.state.OpNum,
-				ReplicaID: r.state.ID,
+			Type: InternalPrepareOK,
+			Data: InternalPrepareOKData{
+				pok: events.PrepareOK{
+					ViewNum:   r.state.ViewNumber,
+					OpNum:     r.state.OpNum,
+					ReplicaID: r.state.ID,
+				},
+				req:        req,
+				clientaddr: from,
 			},
 		},
 	})
@@ -441,6 +454,28 @@ func (r *Replica) onPrepare(from ipv4port.IPv4Port, ev events.Prepare) {
 	}
 
 	r.logger.Debug("sent prepareOK to primary", "opNum", ev.OpNum)
+}
+
+func (r *Replica) onInternalPrepareOK(from ipv4port.IPv4Port, pok InternalPrepareOKData) {
+	r.logger.Debug("received internal prepareOK", "from", from.String(), "replica id", r.state.ID)
+
+	_, ok := r.internal.pendingPOKs[pok.req.ID]
+	if !ok {
+		r.internal.pendingPOKs[pok.req.ID] = PendingPrepareOK{
+			ClientAddr: pok.clientaddr,
+			Request:    pok.req,
+			Responses:  map[uint64]struct{}{},
+		}
+	} else {
+		r.internal.pendingPOKs[pok.req.ID] = PendingPrepareOK{
+			ClientAddr: pok.clientaddr,
+			Request:    pok.req,
+			Responses:  r.internal.pendingPOKs[pok.req.ID].Responses,
+		}
+	}
+
+	// Do normal prepareOK processing
+	r.onPrepareOK(from, pok.pok)
 }
 
 // onPrepareOK handles prepare ok messages sent by the backups to the primary.
@@ -813,7 +848,7 @@ func (r *Replica) initiateStateTransfer(newViewNum, newOpNum uint64) {
 		"current op num", r.state.OpNum,
 	)
 
-	if r.state.Status != ReplicaStatusNormal {
+	if r.state.Status != ReplicaStatusNormal && r.state.Status != ReplicaStatusStateTransfer {
 		// Remove the timer, as we might have entered a view change state or
 		// recovery state. If a state transfer would still be needed, next calls
 		// to prepare or commit will trigger it.
