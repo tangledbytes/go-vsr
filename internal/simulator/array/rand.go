@@ -16,7 +16,7 @@ type Rand[T any] struct {
 func NewRand[T any](rng *rand.Rand, logger *slog.Logger) *Rand[T] {
 	randpickpercent := rng.Float64() * constant.UNORDERED_PACKET_DELIVERY_PERCENT
 
-	logger.Info(
+	logger.Debug(
 		"new rand array created",
 		"rand pick percent", randpickpercent*100,
 	)
