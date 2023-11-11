@@ -33,9 +33,8 @@ jobs:
           export CLIENT_DEBUG=-1
           export SIMULATOR_DEBUG=0
           SEED=$(python3 -c 'import random; rng = random.SystemRandom(); print(rng.randint(0, 2**64-1))')
-          timeout 3h go run ./cmd/simulator 4194837988223983321
+          timeout 3h go run ./cmd/simulator ${SEED}
           exit_code=$?
-          SEED="4194837988223983321" # temporary
           if [ $exit_code -eq 0 ]; then
             echo "Simulation finished successfully"
           else
@@ -54,6 +53,5 @@ jobs:
             -H "X-GitHub-Api-Version: 2022-11-28" \
             https://api.github.com/repos/tangledbytes/go-vsr/issues \
             -d "{\"title\":\"${issue}\",\"labels\":[\"auto-simulation\"]}"
-
             exit 1
           fi
