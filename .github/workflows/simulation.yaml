@@ -42,10 +42,10 @@ jobs:
             issue=""
             if [ $exit_code -eq 124 ]; then
               echo "Simulation timed out for seed ${SEED}"
-              issue="Simulation timed out for seed `${SEED}`"
+              issue="Simulation timed out for seed \`${SEED}\`"
             else
               echo "Simulation failed for seed ${SEED}"
-              issue="Simulation failed for seed `${SEED}`"
+              issue="Simulation failed for seed \`${SEED}\`"
             fi
             curl -L \
             -X POST \
