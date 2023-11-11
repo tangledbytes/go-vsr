@@ -46,7 +46,7 @@ func (s *store) Apply(m string) string {
 }
 
 func New(seed uint64, replicalogger, clientlogger, simlogger *slog.Logger) *Simulator {
-	time := time.NewVirtual(100 * time.MICROSECOND) // In this world, 1 mus is 1 tick.
+	time := time.NewVirtual(250 * time.MICROSECOND) // In this world, 1 mus is 1 tick.
 	rng := rand.New(rand.NewSource(int64(seed)))
 
 	return &Simulator{
@@ -126,7 +126,7 @@ func (s *Simulator) Simulate() {
 }
 
 func (s *Simulator) clusterProgressVerifier(sentReq, processedReq *int) func() {
-	timer := time.NewTimer(s.time, 10*time.MINUTE)
+	timer := time.NewTimer(s.time, 5*time.MINUTE)
 	last := uint64(0)
 
 	timer.Action(func(t *time.Timer) {
@@ -297,7 +297,7 @@ func (s *Simulator) simulateRequests(sentReq, reqCount int) int {
 			cID := s.rng.Intn(len(s.clients))
 			client := s.clients[cID]
 
-			key := fmt.Sprintf("entry-%d", s.rng.Int())
+			key := utils.RandomString(s.rng)
 			if client.Request(key) {
 				s.simStore.Apply(key)
 				success += 1

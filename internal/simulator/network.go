@@ -22,19 +22,22 @@ type Route struct {
 
 	dropPercent float64
 	dupsPercent float64
+	delayTimer  *time.Timer
 }
 
 type Routes struct {
 	rng        *rand.Rand
+	time       *time.Virtual
 	idxSrcDest map[string]map[string]int
 	idxSrcAny  map[string][]*Route
 
 	logger *slog.Logger
 }
 
-func NewRoutes(rng *rand.Rand, logger *slog.Logger) *Routes {
+func NewRoutes(rng *rand.Rand, time *time.Virtual, logger *slog.Logger) *Routes {
 	return &Routes{
 		rng:        rng,
+		time:       time,
 		idxSrcDest: make(map[string]map[string]int),
 		idxSrcAny:  make(map[string][]*Route),
 
@@ -61,16 +64,22 @@ func (r *Routes) AddPacket(src, dest string, ev events.NetworkEvent) bool {
 
 		dupspercent := r.rng.Float64() * constant.PACKET_DUPS_PERCENT
 		droppercent := r.rng.Float64() * constant.PACKET_DROP_PERCENT
+		delayTimer := utils.RandomIntRange(r.rng, constant.MIN_PACKET_DELAY, constant.MAX_PACKET_DELAY)
 		r.logger.Debug(
 			"new route created",
 			"drop percent", droppercent*100,
 			"dups percent", dupspercent*100,
+			"delay timer", delayTimer,
 		)
 
 		r.idxSrcAny[dest] = append(r.idxSrcAny[dest], &Route{
 			data:        array.NewRand[events.NetworkEvent](r.rng, r.logger),
 			dropPercent: droppercent,
 			dupsPercent: dupspercent,
+			delayTimer: time.NewTimer(
+				r.time,
+				uint64(delayTimer),
+			),
 		})
 	}
 
@@ -100,7 +109,7 @@ type SimulatedNetworkWorld struct {
 
 func NewSimulatedNetworkWorld(time *time.Virtual, rng *rand.Rand, logger *slog.Logger) *SimulatedNetworkWorld {
 	return &SimulatedNetworkWorld{
-		routes: NewRoutes(rng, logger),
+		routes: NewRoutes(rng, time, logger),
 		time:   time,
 		rng:    rng,
 
@@ -120,7 +129,6 @@ func (snw *SimulatedNetworkWorld) Node(addr string) *SimulatedNetworkNode {
 	return &SimulatedNetworkNode{
 		routes: snw.routes,
 		addr:   ipv4port,
-		time:   snw.time,
 		rng:    snw.rng,
 
 		logger: snw.logger,
@@ -130,7 +138,6 @@ func (snw *SimulatedNetworkWorld) Node(addr string) *SimulatedNetworkNode {
 type SimulatedNetworkNode struct {
 	routes *Routes
 	addr   ipv4port.IPv4Port
-	time   *time.Virtual
 	rng    *rand.Rand
 
 	logger *slog.Logger
@@ -146,10 +153,6 @@ func (n *SimulatedNetworkNode) Send(dest ipv4port.IPv4Port, f func(io.Writer) er
 	if err := ev.FromReader(buf); err != nil {
 		return err
 	}
-
-	// add delay by ticking time
-	delay := utils.RandomIntRange(n.rng, constant.MIN_PACKET_DELAY, constant.MAX_PACKET_DELAY)
-	n.time.TickBy(uint64(delay))
 
 	// duplications ?
 	send := 1
@@ -177,6 +180,11 @@ func (n *SimulatedNetworkNode) Recv() (events.NetworkEvent, bool) {
 	}
 
 	dest := n.rng.Intn(l)
+	if !n.routes.idxSrcAny[this][dest].delayTimer.Done() {
+		return events.NetworkEvent{}, false
+	}
+
+	n.routes.idxSrcAny[this][dest].delayTimer.Reset()
 	nev, ok := n.routes.idxSrcAny[this][dest].data.Pop()
 	if !ok {
 		return events.NetworkEvent{}, false
