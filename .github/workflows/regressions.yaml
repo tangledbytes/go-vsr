@@ -20,10 +20,4 @@ jobs:
         with:
           go-version: '1.21.3'
       - name: Run simulation on previous issue seeds
-        run: |
-          export CPU_PROFILE=0
-          export HEAP_PROFILE=0
-          export REPLICA_DEBUG=-1
-          export CLIENT_DEBUG=-1
-          export SIMULATOR_DEBUG=0
-          cat records/regression_seeds | xargs go run ./cmd/simulator
+        run: bash ./scripts/regression.sh
