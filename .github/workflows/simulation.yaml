@@ -12,6 +12,8 @@ on:
 jobs:
   simualation_test:
     runs-on: ubuntu-latest
+    permissions:
+      issues: write
     steps:
       - name: Checkout
         uses: actions/checkout@v2
@@ -52,4 +54,6 @@ jobs:
             -H "X-GitHub-Api-Version: 2022-11-28" \
             https://api.github.com/repos/tangledbytes/go-vsr/issues \
             -d "{\"title\":\"${issue}\",\"labels\":[\"auto-simulation\"]}"
+
+            exit 1
           fi
