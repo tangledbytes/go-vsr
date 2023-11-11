@@ -99,8 +99,10 @@ func (s *Simulator) Simulate() {
 	progressVerifier := s.clusterProgressVerifier(&sentReq, &processedReq)
 	for {
 		s.runReplicas()
+
 		s.clusterSanityChecks()
 		progressVerifier()
+
 		sentReq += s.simulateRequests(sentReq, reqCount)
 		processedReq += s.runClients()
 

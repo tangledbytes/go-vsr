@@ -195,11 +195,7 @@ func (c *Client) sendRequest(to ipv4port.IPv4Port, op string) error {
 }
 
 func (c *Client) broadcastRequest(op string) error {
-	for mi, member := range c.state.LastKnownClusterMembers {
-		if mi == int(c.state.ID) {
-			continue
-		}
-
+	for _, member := range c.state.LastKnownClusterMembers {
 		if err := c.sendRequest(member, op); err != nil {
 			return err
 		}
