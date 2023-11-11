@@ -28,7 +28,7 @@ jobs:
           export REPLICA_DEBUG=-1
           export CLIENT_DEBUG=-1
           export SIMULATOR_DEBUG=0
-          timeout 3h go run ./cmd/simulator
+          timeout 3h go run ./cmd/simulator 4194837988223983321
           exit_code=$?
           if [ $exit_code -eq 124 ]; then echo "Simulation timed out"; FAIL=2
           elif [ $exit_code -eq 0 ]; then echo "Simulation finished";
