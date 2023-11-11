@@ -19,6 +19,7 @@ jobs:
       - name: Run simulation
         id: run_simulation
         run: |
+          set +e
           export CPU_PROFILE=0
           export HEAP_PROFILE=0
           export REPLICA_DEBUG=-1
