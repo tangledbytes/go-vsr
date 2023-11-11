@@ -21,6 +21,8 @@ jobs:
           go-version: '1.21.3'
       - name: Run simulation
         id: run_simulation
+        env: 
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           set +e
           export CPU_PROFILE=0
@@ -28,33 +30,26 @@ jobs:
           export REPLICA_DEBUG=-1
           export CLIENT_DEBUG=-1
           export SIMULATOR_DEBUG=0
+          SEED=$(python3 -c 'import random; rng = random.SystemRandom(); print(rng.randint(0, 2**64-1))')
           timeout 3h go run ./cmd/simulator 4194837988223983321
+          SEED="4194837988223983321" # temporary
           exit_code=$?
-          if [ $exit_code -eq 124 ]; then echo "Simulation timed out"; FAIL=2
-          elif [ $exit_code -eq 0 ]; then echo "Simulation finished";
-          else echo "Simulation failed"; FAIL=1
+          if [ $exit_code -eq 0 ]; then
+            echo "Simulation finished successfully"
+          else
+            issue=""
+            if [ $exit_code -eq 124 ]; then
+              echo "Simulation timed out for seed ${SEED}"
+              issue="Simulation timed out for seed `${SEED}`"
+            else
+              echo "Simulation failed for seed ${SEED}"
+              issue="Simulation failed for seed `${SEED}`"
+            fi
+            curl -L \
+            -X POST \
+            -H "Accept: application/vnd.github+json" \
+            -H "Authorization: Bearer ${GITHUB_TOKEN}" \
+            -H "X-GitHub-Api-Version: 2022-11-28" \
+            https://api.github.com/repos/tangledbytes/go-vsr/issues \
+            -d "{\"title\":\"${issue}\",\"labels\":[\"auto-simulation\"]}"
           fi
-          echo "seed=${SEED}" >> $GITHUB_OUTPUT
-          echo "output=${FAIL}" >> $GITHUB_OUTPUT
-      - name: GH API open issue if failed
-        uses: octokit/request-action@v2.x
-        if: ${{ steps.run_simulation.outputs.output == 1 }}
-        with:
-          route: POST /repos/{owner}/{repo}/issues
-          owner: tangledbytes
-          repo: go-vsr
-          title: Simulation failed for seed `${{ steps.run_simulation.outputs.seed }}`
-          labels: "auto-simulation"
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-      - name: GH API open issue if timedout
-        uses: octokit/request-action@v2.x
-        if: ${{ steps.run_simulation.outputs.output == 2 }}
-        with:
-          route: POST /repos/{owner}/{repo}/issues
-          owner: tangledbytes
-          repo: go-vsr
-          title: Simulation timedout for seed `${{ steps.run_simulation.outputs.seed }}`
-          labels: "auto-simulation"
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
